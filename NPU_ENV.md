@@ -69,3 +69,52 @@ npu-smi info                                   # 1×910B2, OK, 64GB
 python3 -c "import torch, torch_npu; print(torch_npu.npu.device_count(), torch_npu.npu.get_device_name(0))"  # 1 Ascend910B2
 # bf16 matmul 2048×2048 ×20 次 ≈ 0.12s，正常
 ```
+
+## 6. 运行形态：本机 debug，集群提交跑
+
+- **本机（本仓库所在机器）**：单卡 910B2，用于 debug，环境问题尽量通过启动脚本解决
+- **最终运行**：ModelArts 集群提交（8 卡/节点、多机），环境由集群注入（`VC_WORKER_HOSTS`/`MA_NUM_HOSTS`/`VC_TASK_INDEX`/`CANN_DIR`）
+- 参考仓库已给出「debug 版 + 集群版」脚本对：
+  - debug 版：`examples/mm_model/duplex_huanyu_qwen35/pretrain_debug_cls.sh`（本机路径硬编码、单机 127.0.0.1、`--is-debug`）
+  - 集群版：`examples/mm_model/duplex_huanyu_qwen35/pretrain_al_cls.sh`（ModelArts 变量、`--load`/`--skip-redundent-pp-load`）
+- 建议 qwen3-tts 的 NPU 适配同样产出两个启动脚本，训练代码保持 device 无关
+
+### 6.1 启动脚本环境配方（客户现成做法，可直接套用）
+
+以下来自 debug 版脚本（集群版仅路径来源不同，变量配方一致）：
+
+1. **source CANN 环境**（本机用本地 CANN 8.5.0，覆盖系统 8.1.RC1）：
+   ```bash
+   CANN_DIR=/home/ma-user/work/dataset/CANN_805_ENV/cann85_0116
+   source "${CANN_DIR}"/cann-8.5.0/set_env_local.sh
+   source "${CANN_DIR}"/nnal/atb/set_env.sh
+   export ASCEND_HOME_PATH="${CANN_DIR}/cann-8.5.0"
+   export ASCEND_TOOLKIT_HOME="${ASCEND_HOME_PATH}"
+   ```
+   ✅ 已验证：source 后 torch_npu 2.1.0.post8 在本机正常 import 并完成 bf16 计算
+   （集群版对应 `source "${CANN_DIR}"/ascend-toolkit/set_env.sh`，CANN_DIR 由集群注入）
+2. **Ascend 调优/日志变量**（debug/集群两版相同）：
+   ```bash
+   export CUDA_DEVICE_MAX_CONNECTIONS=1
+   export ASCEND_GLOBAL_LOG_LEVEL=3
+   export TASK_QUEUE_ENABLE=2 COMBINED_ENABLE=1 CPU_AFFINITY_CONF=1
+   export NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0 ACLNN_CACHE_LIMIT=1000
+   ```
+3. **HCCL 通信超时**：
+   ```bash
+   export MS_NODE_TIMEOUT=3600 HCCL_CONNECT_TIMEOUT=3600 HCCL_EXEC_TIMEOUT=7200
+   ```
+4. **依赖安装 + triton 定制**（本机包路径 `/home/ma-user/work/dataset/sfs_al/pkg/`）：
+   ```bash
+   pip install numba llvmlite zarr torchvision==0.16.1
+   pip install <sfs_al>/pkg/szy_build_0926/triton_ascend-3.2.0+git9058aa1f-cp39-cp39-linux_aarch64.whl --no-deps
+   export TRITON_BACKEND=mindspore
+   # 再覆盖 site-packages/triton/backends/ascend/backend_register.py 和 testing.py
+   ```
+   ⚠️ 本机当前**未装 triton**（`pip show triton` 为空），跑这套前需先按上面步骤安装
+5. **PYTHONPATH**（仓库内源码直用，非 pip 安装）：
+   ```bash
+   export PYTHONPATH=<repo>/msadapter/msa_thirdparty:<repo>/mindspeed-llm:<repo>/msadapter:<repo>/mindspeed:<repo>/megatron:$PYTHONPATH
+   ```
+   ⚠️ 本机这份参考仓库**缺 `mindspeed-llm` 目录**（集群版本才有）
+6. **分布式**：debug 版 `NPUS_PER_NODE=4`（本机只有 1 卡，需改 1）`MASTER_ADDR=127.0.0.1`；集群版读 ModelArts 环境变量，`msrun` 启动
