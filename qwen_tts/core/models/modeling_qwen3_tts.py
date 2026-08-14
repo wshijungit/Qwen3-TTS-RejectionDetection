@@ -14,6 +14,10 @@
 # limitations under the License.
 """PyTorch Qwen3TTS model."""
 
+# 昇腾现役 conda 是 py3.9，本文件有 PEP 604 注解（str | None），
+# 不加这行 import 即 TypeError。
+from __future__ import annotations
+
 import json
 import os
 from dataclasses import dataclass
@@ -90,6 +94,21 @@ def download_weights_from_hf_specific(
             local_files_only=local_only,
         )
     return hf_folder
+
+
+
+def _compute_token_ce_loss(logits: torch.Tensor, labels: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """不做 shift 的 token CE。
+
+    HF 的 self.loss_function（ForCausalLMLoss）会在内部把 labels 左移一位。而微调
+    脚本若同时手工 shift，就变成双 shift——不报错，只表现为训不出东西。
+    统一约定：**模型侧不 shift，由 collate 把 label 摆到因果前一格**。
+    """
+    return F.cross_entropy(
+        logits.reshape(-1, vocab_size),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
 
 
 class Res2NetBlock(torch.nn.Module):
@@ -1239,7 +1258,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = _compute_token_ce_loss(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
 
         return Qwen3TTSTalkerCodePredictorOutputWithPast(
             loss=loss,
@@ -1300,7 +1319,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = _compute_token_ce_loss(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
 
         return Qwen3TTSTalkerCodePredictorOutputWithPast(
             loss=loss,
@@ -1728,7 +1747,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = _compute_token_ce_loss(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
 
 
         return Qwen3TTSTalkerOutputWithPast(
