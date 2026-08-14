@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -78,7 +79,7 @@ CHUNK = 20000
 PUNCT = "。；;，,、 \t\r\n"
 
 
-# ---------------------------------------------------------------- CoT 转写
+# ---------------------------------------------------------------- instruct 转写
 
 
 def norm_evidence(evidence):
@@ -95,22 +96,29 @@ def norm_evidence(evidence):
 
 # 打标结论的收尾语。它描述的是"该不该拒识"这个判定，不是"该怎么说话"，
 # 留在 instruct 里只会稀释风格信号。
-VERDICT_TAILS = ("，应予拒识", "，应予响应", "，应拒识", "，应响应",
-                 "应予拒识", "应予响应", "应拒识", "应响应")
+#
+# 用正则而非后缀元组：真实数据里结论词有 应予拒识 / 应拒识 / 不应拒识 / 应予响应 …
+# 多种变体，按元组逐个 endswith 会出现"短的挡住长的"——3 字的「应拒识」先命中
+# 「不应拒识」，剥完剩一个反义的「不」字（data_report.md:113 那条真实样本
+# "用户在多轮交互中明确回答了助手的提问，不应拒识。" 即触发，且它全落在 accept 侧）。
+_VERDICT_RE = re.compile(
+    r"[，,、;；\s]*(?:因此|所以|故|则|应当|故而)?\s*"
+    r"不?应(?:予|当|该)?(?:拒识|响应|识别|接受)"
+    r"[。.！!？?…\s]*$"
+)
+_TAIL_PUNCT = "。.！!？?…，,、；;： \t"
 
 
 def strip_verdict(reason):
-    r = reason.strip().rstrip("。 ")
-    for t in VERDICT_TAILS:
-        if r.endswith(t):
-            r = r[: -len(t)].rstrip("，, ")
-            break
-    return r + "。"
+    r = _VERDICT_RE.sub("", reason.strip()).rstrip(_TAIL_PUNCT)
+    return r + "。" if r else ""
 
 
 def build_instruct(evidence, reason):
     """gemini 的 evidence + reason → VoiceDesign 的 instruct 串。纯机械转写。"""
-    return "；".join(evidence) + "。" + strip_verdict(reason)
+    head = "；".join(evidence) + "。"
+    tail = strip_verdict(reason)      # 整句都是结论词时返回空串
+    return head + tail if tail else head
 
 
 def build_row(text, wav_path, instruct):
@@ -384,8 +392,8 @@ def check_fingerprint(wav_out_dir, ds_name, fp, skip_existing, clean_stale=False
 
     **不做删除**：allow=False 时 process_one 会对每条候选重算并覆盖，旧参数产物
     永远不会被使用，删除纯属磁盘卫生。而无条件删除的代价极大——一次 `--limit 100`
-    的调试跑就会抹掉全量 43.5w 条、50-60GB 的产物，且旧 train.json 仍指向这些路径，
-    speech_dataset.py 在路径不存在时是静默当文本处理（不报错），会退化成纯文本训练。
+    的调试跑就会抹掉全量 43.5w 条、50-60GB 的产物，且旧 jsonl 仍指向这些路径，
+    下游 prepare_data.py 读不到 wav 会直接抛异常，整个 job 挂掉。
     需要清理时用 --clean-stale 显式开启。
     """
     d, path = _fp_path(wav_out_dir, ds_name)
@@ -503,7 +511,7 @@ def drop_base(s, reason):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="拒识 jsonl → MiMo-Audio-Training 官方 JSON",
+        description="拒识打标 jsonl → Qwen3-TTS VoiceDesign 微调 JSONL",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument(
@@ -561,8 +569,7 @@ def main():
         ap.error("--val-size 至少为 1：训练脚本配了 eval_strategy=steps，空验证集会在首次 eval 时崩")
 
     random.seed(args.seed)
-    # 训练脚本的 cwd 与本脚本不同，写进 train.json 的必须是绝对路径：
-    # speech_dataset.py 用 os.path.isfile() 判断是音频还是文本，路径不存在时会静默当成文本处理
+    # 下游 prepare_data.py 的 cwd 与本脚本不同，写进 jsonl 的必须是绝对路径
     args.out_dir = os.path.abspath(args.out_dir)
     os.makedirs(args.out_dir, exist_ok=True)
     wav_out_dir = os.path.abspath(args.wav_out_dir or os.path.join(args.out_dir, "wav"))
@@ -616,7 +623,7 @@ def main():
         # 阶段二：音频处理。
         # 进程池建在分块循环**内部**：ProcessPoolExecutor 一旦有 worker 异常终止就会进入
         # 永久 broken 状态，后续所有 submit/map 立即抛 BrokenProcessPool。若池建在循环外，
-        # 第 3 万条崩掉会导致剩下 40 万条一条都处理不到，而脚本仍"正常"输出 train.json。
+        # 第 3 万条崩掉会导致剩下 40 万条一条都处理不到，而脚本仍"正常"输出 jsonl。
         done = 0
         for start in range(0, len(candidates), CHUNK):
             chunk = candidates[start : start + CHUNK]
@@ -666,7 +673,7 @@ def main():
     random.shuffle(kept_recs)
 
     all_samples, manifest = [], []
-    for i, (rec, ds_name) in enumerate(kept_recs):
+    for rec, ds_name in kept_recs:
         instruct = build_instruct(rec["evidence"], rec["reason"])
         all_samples.append(build_row(rec["text"], rec["_wav"], instruct))
         manifest.append(
