@@ -83,8 +83,8 @@ def train():
     parser.add_argument("--language", type=str, default="Chinese",
                         help="决定 codec 前缀走 think+language 还是 Auto 的 nothink")
     parser.add_argument("--max_steps", type=int, default=-1, help="调试用，>0 时提前停")
-    parser.add_argument("--attn", type=str, default="flash_attention_2",
-                        help="NPU 上 flash_attention_2 不可用，改 sdpa 或 eager")
+    parser.add_argument("--attn", type=str, default="sdpa",
+                        help="CUDA 上可传 flash_attention_2；NPU 上不可用，保持 sdpa/eager")
     parser.add_argument("--log_every", type=int, default=10)
     args = parser.parse_args()
 
@@ -111,6 +111,7 @@ def train():
     model.train()
 
     gstep = 0
+    stop = False
     for epoch in range(args.num_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
@@ -145,6 +146,7 @@ def train():
                     attention_mask=attention_mask,
                     labels=codec_0_labels,
                     output_hidden_states=True,
+                    use_cache=False,
                 )
                 hidden_states = outputs.hidden_states[0][-1]
                 loss = outputs.loss + args.sub_talker_loss_weight * _sub_talker_loss(
@@ -162,27 +164,44 @@ def train():
             gstep += 1
             if args.max_steps > 0 and gstep >= args.max_steps:
                 accelerator.print(f"到达 --max_steps {args.max_steps}，提前结束")
+                stop = True
                 break
-        if args.max_steps > 0 and gstep >= args.max_steps:
+
+        # 无论是正常跑完一个 epoch 还是被 --max_steps 截断，都要落盘，
+        # 否则调试跑（--max_steps 50）训完磁盘上什么都没有
+        _save(accelerator, model, args, MODEL_PATH, epoch)
+        if stop:
             break
 
-        if accelerator.is_main_process:
-            out_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            shutil.copytree(MODEL_PATH, out_dir, dirs_exist_ok=True)
 
-            # 保持 voice_design —— 官方脚本这里硬写 custom_voice，产出的 ckpt 会被
-            # qwen3_tts_model.py:686 的 != "voice_design" 直接拒掉
-            with open(os.path.join(MODEL_PATH, "config.json"), encoding="utf-8") as f:
-                cfg = json.load(f)
-            cfg["tts_model_type"] = "voice_design"
-            with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2, ensure_ascii=False)
+def _save(accelerator, model, args, MODEL_PATH, epoch):
+    if accelerator.is_main_process:
+        out_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
+        shutil.copytree(MODEL_PATH, out_dir, dirs_exist_ok=True)
 
-            sd = {k: v.detach().to("cpu")
-                  for k, v in _unwrap(model).state_dict().items()
-                  if not k.startswith("speaker_encoder")}   # VoiceDesign 用不到
-            save_file(sd, os.path.join(out_dir, "model.safetensors"))
-            accelerator.print(f"已保存 {out_dir}")
+        # 保持 voice_design —— 官方脚本这里硬写 custom_voice，产出的 ckpt 会被
+        # qwen3_tts_model.py:686 的 != "voice_design" 直接拒掉
+        with open(os.path.join(MODEL_PATH, "config.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["tts_model_type"] = "voice_design"
+        # 训练用的 language 决定 codec 前缀（Chinese→think+lang 5 格 /
+        # Auto→nothink 4 格）。generate_voice_design 的 language 默认是 Auto，
+        # 与此不一致就是静默失配，故记进 config 供推理侧对齐。
+        cfg["v2_train_language"] = args.language
+        with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+        sd = {k: v.detach().to("cpu")
+              for k, v in _unwrap(model).state_dict().items()
+              if not k.startswith("speaker_encoder")}   # VoiceDesign 下本就为 None，防御性保留
+        # 若源目录是分片 checkpoint，index.json 会让下面写的单文件失效，
+        # 加载时静默读回原始权重 → 微调结果丢失
+        idx = os.path.join(out_dir, "model.safetensors.index.json")
+        if os.path.exists(idx):
+            os.remove(idx)
+        save_file(sd, os.path.join(out_dir, "model.safetensors"),
+                  metadata={"format": "pt"})
+        accelerator.print(f"已保存 {out_dir}")
 
 
 if __name__ == "__main__":

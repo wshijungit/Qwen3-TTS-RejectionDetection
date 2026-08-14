@@ -23,7 +23,8 @@ BATCH_INFER_NUM = 32
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="cuda:0",
+                        help="NPU 上传 npu:0")
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     parser.add_argument("--input_jsonl", type=str, required=True)
     parser.add_argument("--output_jsonl", type=str, required=True)

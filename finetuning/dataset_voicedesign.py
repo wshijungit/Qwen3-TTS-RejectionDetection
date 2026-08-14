@@ -36,14 +36,9 @@
     文本    instruct tokens  | role(3 token) | pad×(nb-1), bos     | text, eos, pad  | pad
     codec   (空, mask off)   | (空, mask off)| think/lang/pad 等   | codec_pad, bos  | codec_0
 """
-from typing import Any, List, Tuple, Union
-
-import numpy as np
 import torch
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from torch.utils.data import Dataset
-
-MaybeList = Union[Any, List[Any]]
 
 
 class VoiceDesignTTSDataset(Dataset):
@@ -119,7 +114,7 @@ class VoiceDesignTTSDataset(Dataset):
             b["instruct_ids"].shape[1] + b["text_ids"].shape[1] + b["audio_codes"].shape[0]
             for b in batch
         ]
-        b_, t = len(batch), max(lens) + 8
+        b_, t = len(batch), max(lens) + nb + 4   # end = lens+nb+3，留 1 格余量
 
         input_ids = torch.zeros((b_, t, 2), dtype=torch.long)
         codec_ids = torch.zeros((b_, t, 16), dtype=torch.long)
@@ -155,16 +150,27 @@ class VoiceDesignTTSDataset(Dataset):
             input_ids[i, a + nb - 1, 0] = self.config.tts_bos_token_id
             input_ids[i, a:a + nb, 1] = torch.tensor(codec_prefix, dtype=torch.long)
 
-            # ---- 4. 正文 + eos，codec 侧对应 pad，最后一格换 codec_bos ----
+            # ---- 4. 正文 + tts_eos，codec 侧**全部** codec_pad（含 eos 那格）----
             s = a + nb                      # 正文起点
             n_body = n_txt - 3              # 去掉 role 的正文长度
             input_ids[i, s:s + n_body, 0] = text_ids[0, 3:]
             input_ids[i, s + n_body, 0] = self.config.tts_eos_token_id
-            input_ids[i, s:s + n_body, 1] = tc.codec_pad_id
-            input_ids[i, s + n_body, 1] = tc.codec_bos_id
+            input_ids[i, s:s + n_body + 1, 1] = tc.codec_pad_id
+
+            # ---- 4b. codec_bos 独占一格，文本侧是 tts_pad ----
+            # 推理侧（modeling:2224-2245 的 non-streaming 分支）把这两段分开拼：
+            #   ① text_emb(正文)+tts_eos  叠  codec_pad × (n_body+1)
+            #   ② tts_pad_embed           叠  emb(codec_bos)
+            # 若把 tts_eos 与 codec_bos 并成一格，推理时模型会在一个训练中从未
+            # 出现过的 (tts_pad, codec_bos) 组合上被要求吐第一帧 codec，且
+            # (tts_eos, codec_pad) 也从未共现——不报错，只表现为训完推理就崩。
+            # 官方 dataset.py:174/175 vs :190/191 也是分两格的。
+            bpos = s + n_body + 1
+            input_ids[i, bpos, 0] = self.config.tts_pad_token_id
+            input_ids[i, bpos, 1] = tc.codec_bos_id
 
             # ---- 5. 音频码 ----
-            c = s + n_body + 1
+            c = bpos + 1
             input_ids[i, c:c + n_cod, 1] = codec_0
             input_ids[i, c + n_cod, 1] = tc.codec_eos_token_id
             input_ids[i, c:c + n_cod + 1, 0] = self.config.tts_pad_token_id

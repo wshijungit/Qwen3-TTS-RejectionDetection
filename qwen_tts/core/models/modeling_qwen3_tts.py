@@ -104,8 +104,11 @@ def _compute_token_ce_loss(logits: torch.Tensor, labels: torch.Tensor, vocab_siz
     脚本若同时手工 shift，就变成双 shift——不报错，只表现为训不出东西。
     统一约定：**模型侧不 shift，由 collate 把 label 摆到因果前一格**。
     """
+    # .float() 不能省：HF 的 ForCausalLMLoss 第一行就是 logits.float()。
+    # 训练脚本直接调 talker 子模块，accelerate 的 autocast 只包顶层 forward，
+    # 这里拿到的是裸 bf16，log_softmax 在 bf16 下算会明显掉信噪比。
     return F.cross_entropy(
-        logits.reshape(-1, vocab_size),
+        logits.reshape(-1, vocab_size).float(),
         labels.reshape(-1),
         ignore_index=-100,
     )
