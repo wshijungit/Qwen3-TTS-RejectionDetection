@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""V2 VoiceDesign 微调链路在昇腾 NPU 上的分阶段冒烟测试。
+
+设计原则：**每阶段独立可诊断**。任一阶段失败时，输出直接指出是哪一层的问题、
+下一步该怎么办，而不是丢一个 traceback 让人猜。
+
+阶段：
+  0 环境        torch_npu / transformers / accelerate / qwen_tts
+  1 基础算子    bf16 matmul、显存查询
+  2 注意力后端  sdpa vs eager 能否跑、相对耗时（sdpa 若静默退化会体现在耗时上）
+  3 模型加载    VoiceDesign 权重能否加载到 NPU
+  4 音频 tokenizer  抽 audio_codes（prepare_data.py 那一步的核心）
+  5 序列布局    collate 产出与推理侧逐格核对（纯 CPU，不依赖 NPU）
+  6 前反向      若干步训练，看 loss 是否真的在降
+  7 保存加载    ckpt 完整性 + 能否被 from_pretrained 读回
+  8 推理        用微调后的 ckpt 合成，验证 instruct 通路仍然生效
+
+用法：
+    python npu_smoke_test.py --model_path /path/to/VoiceDesign
+    python npu_smoke_test.py --model_path ... --stages 0-6      # 只跑前 7 个
+    python npu_smoke_test.py --model_path ... --real_jsonl x.jsonl  # 用真实数据
+
+产出 npu_smoke_report.txt —— 直接把它贴回来即可定位问题。
+"""
+import argparse
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import traceback
+
+REPORT = []
+
+
+def log(msg=""):
+    print(msg, flush=True)
+    REPORT.append(str(msg))
+
+
+def stage(n, title):
+    log(f"\n{'=' * 66}\n[阶段 {n}] {title}\n{'=' * 66}")
+
+
+def ok(msg):
+    log(f"  ✅ {msg}")
+
+
+def warn(msg):
+    log(f"  ⚠️  {msg}")
+
+
+def fail(msg, howto=""):
+    log(f"  ❌ {msg}")
+    if howto:
+        for line in howto.strip().split("\n"):
+            log(f"     → {line}")
+    return False
+
+
+# ---------------------------------------------------------------- 0 环境
+
+
+def s0_env():
+    stage(0, "环境")
+    try:
+        import torch
+        import torch_npu  # noqa: F401
+    except Exception as e:
+        return fail(
+            f"torch_npu 不可用: {type(e).__name__}: {e}",
+            "先 source CANN 环境（scripts/npu_env.sh 会做）。\n"
+            "若报找不到 .so，是 CANN 与 torch_npu 版本不配套。",
+        )
+    log(f"  torch {torch.__version__} / torch_npu {torch_npu.__version__}")
+    n = torch.npu.device_count()
+    if n == 0:
+        return fail("看不到 NPU 设备", "npu-smi info 确认卡在位且未被占用")
+    ok(f"{n} 张卡，device0 = {torch.npu.get_device_name(0)}")
+
+    import transformers
+
+    v = tuple(int(x) for x in transformers.__version__.split(".")[:2])
+    if v < (4, 41):
+        return fail(
+            f"transformers {transformers.__version__} 过低",
+            "需 >= 4.41（4.40 没有 eval_strategy，且 fsdp_config 的 bool 会炸）。\n"
+            "pyproject 要求 4.57.3，其 requires-python >=3.9.0，py3.9 可装。",
+        )
+    ok(f"transformers {transformers.__version__}")
+
+    import accelerate
+
+    ok(f"accelerate {accelerate.__version__}")
+    if tuple(int(x) for x in accelerate.__version__.split(".")[:2]) >= (1, 12):
+        warn("accelerate >= 1.12 要求 py>=3.10；若本机是 py3.9 而它能 import，说明装的是别的版本")
+    from accelerate import Accelerator
+
+    missing = [a for a in ("accumulate", "backward", "clip_grad_norm_", "prepare",
+                           "unwrap_model", "is_main_process") if not hasattr(Accelerator, a)]
+    if missing:
+        return fail(f"accelerate 缺少接口 {missing}", "版本过低，升到 1.0.0 以上")
+    ok("Accelerator 具备本链路用到的全部接口")
+
+    import qwen_tts  # noqa: F401
+
+    ok(f"qwen_tts 可 import（python {sys.version.split()[0]}）")
+    return True
+
+
+# ---------------------------------------------------------------- 1 基础算子
+
+
+def s1_ops():
+    stage(1, "基础算子")
+    import torch
+
+    dev = "npu:0"
+    try:
+        a = torch.randn(2048, 2048, dtype=torch.bfloat16, device=dev)
+        t0 = time.time()
+        for _ in range(20):
+            a = a @ a.T / 100
+        torch.npu.synchronize()
+        ok(f"bf16 matmul 2048² ×20 耗时 {time.time() - t0:.3f}s")
+    except Exception as e:
+        return fail(f"bf16 matmul 失败: {type(e).__name__}: {e}", "CANN 与 torch_npu 不配套")
+
+    try:
+        free, total = torch.npu.mem_get_info(0)
+        ok(f"显存 {free / 2**30:.1f} / {total / 2**30:.1f} GiB 可用")
+        if total / 2**30 < 40:
+            warn("单卡显存 < 40GB，1.7B 全参微调需约 27GB + 激活，可能偏紧")
+    except Exception:
+        warn("mem_get_info 不可用，跳过显存检查")
+    return True
+
+
+# ---------------------------------------------------------------- 2 注意力后端
+
+
+def s2_attn(model_path):
+    stage(2, "注意力后端（本链路在 NPU 上最大的性能未知项）")
+    import torch
+    from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
+
+    cfg = Qwen3TTSConfig.from_pretrained(model_path)
+    h = cfg.talker_config.hidden_size
+    nh = cfg.talker_config.num_attention_heads
+    results = {}
+    for impl in ("sdpa", "eager"):
+        try:
+            q = torch.randn(2, nh, 512, h // nh, dtype=torch.bfloat16, device="npu:0")
+            k, v = q.clone(), q.clone()
+            torch.npu.synchronize()
+            t0 = time.time()
+            for _ in range(10):
+                if impl == "sdpa":
+                    torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+                else:
+                    w = (q @ k.transpose(-1, -2)) / (q.shape[-1] ** 0.5)
+                    w = w.masked_fill(torch.triu(torch.ones(512, 512, device=q.device,
+                                                            dtype=torch.bool), 1), float("-inf"))
+                    torch.softmax(w, -1) @ v
+            torch.npu.synchronize()
+            results[impl] = time.time() - t0
+            ok(f"{impl:6} 可用，10 次耗时 {results[impl]:.3f}s")
+        except Exception as e:
+            warn(f"{impl:6} 失败: {type(e).__name__}: {e}")
+
+    if "sdpa" not in results:
+        return fail("sdpa 不可用", "启动脚本传 ATTN=eager")
+    if "eager" in results and results["sdpa"] > results["eager"] * 0.9:
+        warn("sdpa 并不比 eager 快 —— 可能静默退化到 math 分支。\n"
+             "     若训练显存/速度不可接受，考虑改用 torch_npu.npu_fusion_attention（需改模型代码）")
+    else:
+        ok("sdpa 有加速效果，按默认用 sdpa")
+    return True
+
+
+# ---------------------------------------------------------------- 3 模型加载
+
+
+def s3_load(model_path, attn):
+    stage(3, "模型加载")
+    import torch
+    from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+    t0 = time.time()
+    try:
+        m = Qwen3TTSModel.from_pretrained(model_path, dtype=torch.bfloat16,
+                                          attn_implementation=attn, device_map="npu:0")
+    except Exception as e:
+        return fail(f"加载失败: {type(e).__name__}: {e}",
+                    "若是 flash_attention_2 相关，改 --attn sdpa；\n"
+                    "若是 model_type 不认识，确认 qwen_tts 已 pip install -e .")
+    n = sum(p.numel() for p in m.model.parameters())
+    ok(f"加载成功 {time.time() - t0:.1f}s，参数 {n / 1e9:.2f}B，attn={attn}")
+    mt = getattr(m.model.config, "tts_model_type", "?")
+    if mt != "voice_design":
+        return fail(f"tts_model_type = {mt}，不是 voice_design",
+                    "V2 必须用 VoiceDesign 权重；Base/CustomVoice 走的是另一套条件")
+    ok("tts_model_type = voice_design")
+    return m
+
+
+# ---------------------------------------------------------------- 4 音频 tokenizer
+
+
+def s4_codes(model_path, workdir, real_jsonl=None):
+    stage(4, "音频 tokenizer（抽 audio_codes）")
+    import numpy as np
+    import soundfile as sf
+    import torch
+    from qwen_tts.inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+
+    raw = os.path.join(workdir, "train_raw.jsonl")
+    if real_jsonl:
+        rows = [json.loads(l) for l in open(real_jsonl) if l.strip()][:8]
+        with open(raw, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        ok(f"用真实数据 {len(rows)} 条")
+    else:
+        wd = os.path.join(workdir, "wav")
+        os.makedirs(wd, exist_ok=True)
+        rng = np.random.default_rng(0)
+        rows = []
+        cases = [
+            ("打开前排车窗", "用户指令包含明确的车控意图；音频中用户发音清晰且为近场发令。"),
+            ("他妈，但他不是临汾", "用户文本包含语气词和闲聊内容；音频听起来是向他人解释或吐槽。"),
+            ("导航到公司", "用户发出明确的导航请求；指令简短清晰，为对车机发令。"),
+            ("咱这是往哪走", "用户使用咱字，属于与乘客聊天商量；非对车机助手的指令。"),
+        ]
+        for i in range(8):
+            text, ins = cases[i % len(cases)]
+            p = os.path.join(wd, f"s{i}.wav")
+            t = np.arange(int(2.5 * 16000)) / 16000
+            f0 = rng.uniform(100, 200)
+            sig = sum(np.sin(2 * np.pi * f0 * k * t) / k for k in (1, 2, 3))
+            sig = (0.25 * sig * (0.6 + 0.4 * np.sin(2 * np.pi * 3 * t))).astype("float32")
+            sf.write(p, sig, 16000, subtype="PCM_16")
+            rows.append({"audio": p, "text": text, "instruct": ins})
+        with open(raw, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        ok(f"造了 {len(rows)} 条合成样本")
+
+    try:
+        tok = Qwen3TTSTokenizer.from_pretrained(
+            os.path.join(model_path, "speech_tokenizer"),
+            device_map="npu:0", dtype=torch.bfloat16)
+    except Exception as e:
+        return fail(f"tokenizer 加载失败: {type(e).__name__}: {e}",
+                    "确认 speech_tokenizer 子目录存在")
+
+    out = os.path.join(workdir, "train_codes.jsonl")
+    done = []
+    for r in rows:
+        try:
+            c = tok.encode(r["audio"])
+            c = c[0] if isinstance(c, (list, tuple)) else c
+            r["audio_codes"] = c.tolist() if hasattr(c, "tolist") else c
+            done.append(r)
+        except Exception as e:
+            return fail(f"encode 失败: {type(e).__name__}: {e}",
+                        "音频 tokenizer 在 NPU 上有算子不支持；\n"
+                        "临时方案：这一步放 CPU 跑（--device cpu），只训练用 NPU")
+    with open(out, "w") as f:
+        for r in done:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    import numpy as np2  # noqa
+
+    shape = (len(done[0]["audio_codes"]), len(done[0]["audio_codes"][0]))
+    ok(f"抽码成功，{len(done)} 条，shape={shape}（应为 (T, 16)）")
+    if shape[1] != 16:
+        return fail(f"码本数 {shape[1]} != 16", "tokenizer 版本不对")
+    del tok
+    return out
+
+
+# ---------------------------------------------------------------- 5 序列布局
+
+
+def s5_layout(model_path, codes_jsonl, language):
+    stage(5, "序列布局（与推理侧逐格核对，纯 CPU）")
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import torch
+    from dataset_voicedesign import VoiceDesignTTSDataset
+    from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
+    from qwen_tts.core.models.processing_qwen3_tts import Qwen3TTSProcessor
+
+    cfg = Qwen3TTSConfig.from_pretrained(model_path)
+    tc = cfg.talker_config
+    proc = Qwen3TTSProcessor.from_pretrained(model_path)
+    rows = [json.loads(l) for l in open(codes_jsonl)][:2]
+    ds = VoiceDesignTTSDataset(rows, proc, cfg, language=language)
+    b = ds.collate_fn([ds[0], ds[1]])
+    ii, lab = b["input_ids"][0], b["codec_0_labels"][0]
+
+    checks = []
+    bos = [p for p in range(ii.shape[0]) if int(ii[p, 1]) == tc.codec_bos_id]
+    eos = [p for p in range(ii.shape[0]) if int(ii[p, 0]) == cfg.tts_eos_token_id]
+    if not bos or not eos:
+        return fail("找不到 codec_bos 或 tts_eos", "collate 逻辑异常")
+    bp, ep = bos[0], eos[0]
+    checks.append(("codec_bos 与 tts_eos 分处两格", bp == ep + 1))
+    checks.append(("tts_eos 那格 codec = codec_pad", int(ii[ep, 1]) == tc.codec_pad_id))
+    checks.append(("codec_bos 那格 text = tts_pad", int(ii[bp, 0]) == cfg.tts_pad_token_id))
+    nz = (lab != -100).nonzero()
+    checks.append(("label 起点 = codec_bos 位", int(nz[0]) == bp))
+    checks.append(("label 末位 = codec_eos", int(lab[int(nz[-1])]) == tc.codec_eos_token_id))
+    nb = 5 if language.lower() != "auto" else 4
+    pre = [int(ii[p, 1]) for p in range(bp)]
+    want = tc.codec_think_id if language.lower() != "auto" else tc.codec_nothink_id
+    checks.append((f"codec 前缀首 token = {'think' if nb == 5 else 'nothink'}（block 宽 {nb}）",
+                   want in pre))
+    checks.append(("instruct 段 codec_embedding_mask 为 False",
+                   not bool(b["codec_embedding_mask"][0, 0, 0])))
+    allok = True
+    for name, r in checks:
+        (ok if r else lambda m: fail(m))(f"{name}: {'PASS' if r else 'FAIL'}")
+        allok &= r
+    if not allok:
+        return fail("序列布局与推理侧不一致",
+                    "这类错误不报错、loss 照降，但推理必崩。把上面 FAIL 项贴回来")
+    return True
+
+
+# ---------------------------------------------------------------- 6 前反向
+
+
+def s6_train(model_path, codes_jsonl, workdir, attn, language, steps):
+    stage(6, f"前反向（{steps} 步，看 loss 是否真的在降）")
+    ft = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = os.path.join(workdir, "ckpt")
+    cmd = (f"cd {ft} && python sft_12hz_voicedesign.py "
+           f"--init_model_path {model_path} --train_jsonl {codes_jsonl} "
+           f"--output_model_path {out} --batch_size 1 --grad_accum 1 "
+           f"--num_epochs 1 --max_steps {steps} --log_every 1 "
+           f"--attn {attn} --language {language} 2>&1")
+    log(f"  $ {cmd}\n")
+    import subprocess
+
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    tail = (p.stdout or "")[-3000:]
+    for line in tail.strip().split("\n")[-25:]:
+        log(f"  | {line}")
+    if p.returncode != 0:
+        return fail("训练失败，见上方输出",
+                    "OOM → 降 batch_size；\n"
+                    "算子不支持 → 换 --attn eager；\n"
+                    "accelerate 报错 → 版本问题，见阶段 0")
+    losses = []
+    for line in (p.stdout or "").split("\n"):
+        if "Loss:" in line:
+            try:
+                losses.append(float(line.split("Loss:")[1].strip()))
+            except ValueError:
+                pass
+    if len(losses) < 2:
+        return fail("没解析到 loss", "训练可能没真正开始")
+    ok(f"loss {losses[0]:.4f} → {losses[-1]:.4f}（{len(losses)} 步）")
+    if losses[-1] >= losses[0]:
+        warn("loss 没下降。步数太少时正常；若几百步仍不降，怀疑 bf16 无 fp32 主权重导致更新下溢")
+    return out
+
+
+# ---------------------------------------------------------------- 7 保存加载
+
+
+def s7_ckpt(ckpt_root):
+    stage(7, "checkpoint 完整性")
+    d = os.path.join(ckpt_root, "checkpoint-epoch-0")
+    if not os.path.isdir(d):
+        return fail(f"没有产出 {d}", "训练提前退出且未落盘")
+    need = ["config.json", "model.safetensors"]
+    for f in need:
+        if not os.path.exists(os.path.join(d, f)):
+            return fail(f"缺 {f}")
+    ok("config.json + model.safetensors 都在")
+    if os.path.exists(os.path.join(d, "model.safetensors.index.json")):
+        return fail("残留 index.json", "会让新写的单文件失效，加载时静默读回原始权重")
+    ok("无残留 index.json")
+    c = json.load(open(os.path.join(d, "config.json")))
+    if c.get("tts_model_type") != "voice_design":
+        return fail(f"tts_model_type = {c.get('tts_model_type')}",
+                    "会被 qwen3_tts_model.py 的 != voice_design 检查拒掉")
+    ok(f"tts_model_type = voice_design, v2_train_language = {c.get('v2_train_language')}")
+    return d
+
+
+# ---------------------------------------------------------------- 8 推理
+
+
+def s8_infer(ckpt_dir, attn, workdir):
+    stage(8, "推理（验证 instruct 通路仍生效）")
+    import soundfile as sf
+    import torch
+    from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+    try:
+        m = Qwen3TTSModel.from_pretrained(ckpt_dir, dtype=torch.bfloat16,
+                                          attn_implementation=attn, device_map="npu:0")
+    except Exception as e:
+        return fail(f"微调后的 ckpt 加载失败: {type(e).__name__}: {e}")
+    ok("微调后的 ckpt 可加载")
+
+    text = "帮我把空调温度调低两度"
+    ins = {"对机": "坐在车里对车载语音助手下指令，吐字清晰干脆，音调平稳，句尾利落收住",
+           "对人": "开着车侧头跟旁边的人随口说话，语气随意、自然连读，不刻意咬字"}
+    durs = {}
+    for tag, s in ins.items():
+        try:
+            wavs, sr = m.generate_voice_design(text=text, instruct=s, language="Chinese")
+        except Exception as e:
+            return fail(f"生成失败: {type(e).__name__}: {e}")
+        p = os.path.join(workdir, f"infer_{tag}.wav")
+        sf.write(p, wavs[0], sr)
+        durs[tag] = len(wavs[0]) / sr
+        ok(f"{tag}腔 生成成功 {durs[tag]:.2f}s → {p}")
+    d = abs(durs["对机"] - durs["对人"]) / max(durs.values()) * 100
+    log(f"\n  同一句文本、两条 instruct 的时长差 = {d:.1f}%")
+    if d < 3:
+        warn("时长几乎无差异 —— instruct 可能没起作用。听一下两个 wav 再判断")
+    else:
+        ok("时长有明显差异，instruct 通路在起作用（腔调对不对仍需听辨）")
+    return True
+
+
+# ---------------------------------------------------------------- main
+
+
+def main():
+    ap = argparse.ArgumentParser(description="V2 VoiceDesign 微调链路 NPU 冒烟测试")
+    ap.add_argument("--model_path", required=True, help="VoiceDesign 权重目录")
+    ap.add_argument("--stages", default="0-8", help="如 0-6 或 0,1,5")
+    ap.add_argument("--attn", default="sdpa")
+    ap.add_argument("--language", default="Chinese")
+    ap.add_argument("--steps", type=int, default=6)
+    ap.add_argument("--real_jsonl", default=None, help="用真实数据（含 audio/text/instruct）")
+    ap.add_argument("--codes_jsonl", default=None,
+                    help="已抽好 audio_codes 的 jsonl，给定则跳过阶段 4。"
+                         "音频 tokenizer 在 NPU 上跑不动时，可先在 CPU 上抽好再用这个")
+    ap.add_argument("--workdir", default=None)
+    ap.add_argument("--report", default="npu_smoke_report.txt")
+    args = ap.parse_args()
+
+    want = set()
+    for part in args.stages.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            want |= set(range(int(a), int(b) + 1))
+        else:
+            want.add(int(part))
+
+    wd = args.workdir or tempfile.mkdtemp(prefix="npu_smoke_")
+    os.makedirs(wd, exist_ok=True)
+    log(f"工作目录 {wd}\n模型 {args.model_path}\n阶段 {sorted(want)}")
+
+    state = {"codes": args.codes_jsonl, "ckpt_root": None, "ckpt": None}
+    failed = []
+    try:
+        if 0 in want and not s0_env():
+            failed.append(0)
+            raise SystemExit
+        if 1 in want and not s1_ops():
+            failed.append(1)
+        if 2 in want and not s2_attn(args.model_path):
+            failed.append(2)
+        if 3 in want and not s3_load(args.model_path, args.attn):
+            failed.append(3)
+            raise SystemExit
+        if 4 in want and not args.codes_jsonl:
+            state["codes"] = s4_codes(args.model_path, wd, args.real_jsonl)
+            if not state["codes"]:
+                failed.append(4)
+                raise SystemExit
+        if 5 in want and state["codes"]:
+            if not s5_layout(args.model_path, state["codes"], args.language):
+                failed.append(5)
+        if 6 in want and state["codes"]:
+            state["ckpt_root"] = s6_train(args.model_path, state["codes"], wd,
+                                          args.attn, args.language, args.steps)
+            if not state["ckpt_root"]:
+                failed.append(6)
+                raise SystemExit
+        if 7 in want and state["ckpt_root"]:
+            state["ckpt"] = s7_ckpt(state["ckpt_root"])
+            if not state["ckpt"]:
+                failed.append(7)
+        if 8 in want and state["ckpt"]:
+            if not s8_infer(state["ckpt"], args.attn, wd):
+                failed.append(8)
+    except SystemExit:
+        pass
+    except Exception:
+        log("\n未预期异常：")
+        for line in traceback.format_exc().split("\n"):
+            log(f"  {line}")
+        failed.append(-1)
+
+    log(f"\n{'=' * 66}")
+    log("失败阶段: " + (", ".join(map(str, failed)) if failed else "无 —— 全部通过 ✅"))
+    log(f"产物在 {wd}")
+    log("=" * 66)
+    with open(args.report, "w", encoding="utf-8") as f:
+        f.write("\n".join(REPORT) + "\n")
+    print(f"\n报告已写入 {args.report}（把它贴回来即可定位问题）")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
