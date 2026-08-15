@@ -332,17 +332,22 @@ def s4b_pipeline(model_path, workdir, device, n=12):
     # 造打标 jsonl（真实 schema）+ wav：含首尾静音、一条标签不一致、一条纯底噪
     rng = np.random.default_rng(3)
     rows = []
+    noisy_uid = None
     for i in range(n):
         uid = f"{i:032x}"
         sr = 16000
         sil = np.zeros(int(0.8 * sr), dtype="float32")
-        if i == n - 1:                       # 纯底噪 → 应进"无动态"疑似清单
-            body = (rng.standard_normal(int(2.0 * sr)) * 0.001).astype("float32")
+        if i == n - 1:
+            # 纯底噪 → 应进"无动态"疑似清单。**整条**都是低幅噪声，不能加零静音垫边：
+            # db_range 是在整段原始音频上算的，数字零帧约 -200dB、底噪约 -60dB，
+            # 垫了边 db_range 就有 140dB，远超 6dB 阈值，永远判不成"无动态"。
+            wav = (rng.standard_normal(int(3.6 * sr)) * 0.001).astype("float32")
+            noisy_uid = uid
         else:
             t = np.arange(int(2.0 * sr)) / sr
             body = (0.25 * np.sin(2 * np.pi * rng.uniform(120, 200) * t)).astype("float32")
-        sf.write(os.path.join(wavd, f"{uid}.wav"),
-                 np.concatenate([sil, body, sil]), sr, subtype="PCM_16")
+            wav = np.concatenate([sil, body, sil])
+        sf.write(os.path.join(wavd, f"{uid}.wav"), wav, sr, subtype="PCM_16")
         lab = i % 2
         rows.append({
             "uttid": uid, "text": "打开前排车窗" if lab == 0 else "咱这是往哪走",
@@ -378,9 +383,33 @@ def s4b_pipeline(model_path, workdir, device, n=12):
         return fail("产出里有 ref_audio", "VoiceDesign 不用参考音频")
     if not all({"audio", "text", "instruct"} <= set(g) for g in got):
         return fail("字段不全，应为 audio/text/instruct")
-    ok(f"prepare_v2_data.py 通过，产出 {len(got)} 条 {sorted(got[0])}")
-    if os.path.exists(os.path.join(out, "suspicious_vad.jsonl")):
-        ok("suspicious_vad.jsonl 已生成（纯底噪样本应在其中）")
+    # 12 条里第 0 条标签不一致必被筛掉；其余是否保留取决于 VAD，故只断言上界与筛除
+    if len(got) >= n:
+        return fail(f"产出 {len(got)} 条 >= 输入 {n} 条，标签不一致的那条没被筛掉")
+    ok(f"prepare_v2_data.py 通过，产出 {len(got)} 条 {sorted(got[0])}（已筛除标签不一致）")
+
+    # VAD 确实切了静音：正常样本原始 3.6s，切后应明显更短
+    import soundfile as sf2
+
+    # 只看正常样本：纯底噪那条整条都是噪声、没有首尾静音可切，3.6s 原样保留是对的
+    durs = [sf2.info(g["audio"]).duration for g in got
+            if noisy_uid not in os.path.basename(g["audio"])]
+    if not durs or max(durs) > 3.4:
+        return fail(f"VAD 似乎没切静音，正常样本最长产出 "
+                    f"{max(durs) if durs else -1:.2f}s（原始 3.6s，含首尾各 0.8s 静音）")
+    ok(f"VAD 切静音生效，正常样本 {min(durs):.2f}-{max(durs):.2f}s（原始 3.6s）")
+
+    # 疑似清单必须生成且含那条纯底噪 —— 原先写成 if exists 则 ok，
+    # 文件不存在时连 warn 都没有，测试照样全绿
+    sp = os.path.join(out, "suspicious_vad.jsonl")
+    if not os.path.exists(sp):
+        return fail("没有生成 suspicious_vad.jsonl",
+                    "纯底噪样本应被 db_range < 6 判为「无动态」，检查该判据是否失效")
+    hits = [json.loads(l) for l in open(sp, encoding="utf-8")]
+    if not any(h["uttid"] == noisy_uid and "无动态" in h["why"] for h in hits):
+        return fail(f"纯底噪样本 {noisy_uid[:8]}… 未被标为「无动态」",
+                    f"清单里有 {len(hits)} 条：{[(h['uttid'][:8], h['why']) for h in hits][:3]}")
+    ok(f"suspicious_vad.jsonl 生成，纯底噪样本已标「无动态」（共 {len(hits)} 条）")
 
     # prepare_data.py：抽码 + 断点续跑
     codes = os.path.join(wd, "codes.jsonl")
@@ -397,16 +426,29 @@ def s4b_pipeline(model_path, workdir, device, n=12):
     n_all = sum(1 for _ in open(codes, encoding="utf-8"))
     ok(f"prepare_data.py 通过，抽码 {n_all} 条")
 
-    # 截断一半再跑，验断点续跑
-    keep = max(1, n_all // 2)
-    lines = open(codes, encoding="utf-8").readlines()[:keep]
-    with open(codes, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-    r3 = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    n2 = sum(1 for _ in open(codes, encoding="utf-8"))
-    if r3.returncode != 0 or n2 != n_all:
-        return fail(f"断点续跑异常：截断到 {keep} 后补齐得 {n2}，应为 {n_all}")
-    ok(f"断点续跑正确（截断到 {keep} → 补齐 {n_all}）")
+    # 断点续跑：两种截断都要验。行边界是 happy path，**半行才是真实崩溃的样子**
+    # （写单行途中被 kill），而半行曾被当成完整一行跳过、下一条 JSON 粘在后面。
+    src_audio = [json.loads(l)["audio"] for l in open(raw, encoding="utf-8")]
+    for tag, half in (("行边界", False), ("半行", True)):
+        keep = max(1, n_all // 2)
+        lines = open(codes, encoding="utf-8").readlines()[:keep]
+        body = "".join(lines)
+        if half:
+            body += lines[-1][: len(lines[-1]) // 2]   # 再粘半行
+        with open(codes, "w", encoding="utf-8") as f:
+            f.write(body)
+        r3 = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if r3.returncode != 0:
+            return fail(f"续跑（{tag}截断）失败", (r3.stdout or r3.stderr or "")[-400:])
+        try:
+            got2 = [json.loads(l) for l in open(codes, encoding="utf-8")]
+        except Exception as e:
+            return fail(f"续跑（{tag}截断）后 JSON 损坏: {e}",
+                        "半行没被截掉，下一条被粘在后面了")
+        if [g["audio"] for g in got2] != src_audio:
+            return fail(f"续跑（{tag}截断）后与输入不是一一对应",
+                        f"得 {len(got2)} 条，应 {len(src_audio)} 条且顺序一致")
+        ok(f"断点续跑正确（{tag}截断到 {keep} → 补齐 {len(got2)}，逐条对应）")
     return codes
 
 
@@ -508,7 +550,11 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps,
     head, tail = sum(losses[:k]) / k, sum(losses[-k:]) / k
     ok(f"loss 前 {k} 步均值 {head:.4f} → 后 {k} 步均值 {tail:.4f}（共 {len(losses)} 步；"
        f"首末单点 {losses[0]:.4f}/{losses[-1]:.4f} 仅供参考，单样本噪声大）")
-    ok(f"batch={batch} → {steps / max(wall, 1e-9) * batch:.1f} 样本/秒")
+    # 用**实际**步数：epoch 提前结束时（样本数/batch < steps）按请求步数算会虚高。
+    # §12.6 那次 batch=8 就是 256 样本一个 epoch 只跑了 32 步，按 50 步算得 3.2，
+    # 实际是 2.07 样本/秒。
+    ok(f"batch={batch} → {len(losses) * batch / max(wall, 1e-9):.2f} 样本/秒"
+       f"（实跑 {len(losses)} 步，含加载/编译摊销）")
     ok(f"训练总耗时 {wall:.1f}s（含加载/编译），约 {wall / len(losses):.1f}s/step")
     if tail >= head:
         warn("loss 均值没下降。注意 batch=1 且样本数 < 步数时，一个 epoch 内每条只见"

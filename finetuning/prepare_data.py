@@ -54,10 +54,25 @@ def main():
     # 对音质无影响（邻近码字），但**不要指望 codes 逐位可复现**。
     done = 0
     if os.path.exists(args.output_jsonl):
+        # 崩在"写了半行"时，末尾会留下一条没有换行的残行。直接按行数计会把它
+        # 当成完整一行跳过，下一条 JSON 追加在它后面粘成非法行 —— 实测 6 条输入
+        # 只剩 5 行且 1 行损坏，且要等数小时后训练启动 json.loads 时才炸。
+        # 故先把文件截断到最后一个完整换行处。
+        with open(args.output_jsonl, "rb+") as f:
+            raw = f.read()
+            if raw and not raw.endswith(b"\n"):
+                cut = raw.rfind(b"\n")
+                f.seek(0)
+                f.truncate(cut + 1 if cut >= 0 else 0)
+                print(f"续跑：丢弃尾部 {len(raw) - (cut + 1)} 字节的残行", flush=True)
         with open(args.output_jsonl, encoding="utf-8") as f:
             done = sum(1 for l in f if l.strip())
         if done:
             print(f"续跑：已有 {done} 行，跳过", flush=True)
+    if done > len(total_lines):
+        raise SystemExit(
+            f"输出已有 {done} 行 > 输入 {len(total_lines)} 行 —— 输入文件很可能换过，"
+            f"续跑会错配。删掉 {args.output_jsonl} 重跑，或确认输入无误")
     if done >= len(total_lines):
         print("已全部完成"); return
     total_lines = total_lines[done:]
@@ -72,7 +87,7 @@ def main():
         audios.clear()
 
     batch_lines, batch_audios = [], []
-    n = done
+    n, nb = done, 0
     with open(args.output_jsonl, "a", encoding="utf-8") as fh:
         for line in total_lines:
             batch_lines.append(line)
@@ -80,7 +95,8 @@ def main():
             if len(batch_lines) >= BATCH_INFER_NUM:
                 flush(fh, batch_lines, batch_audios)
                 n += BATCH_INFER_NUM
-                if n % (BATCH_INFER_NUM * 50) == 0:
+                nb += 1
+                if nb % 50 == 0:          # 按 batch 计数，不依赖 n 是否为 32 的倍数
                     print(f"  {n}/{done + len(total_lines)}", flush=True)
         if batch_audios:
             n += len(batch_audios)

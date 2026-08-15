@@ -138,9 +138,16 @@ def train():
                         help="CUDA 上可传 flash_attention_2；NPU 上不可用，保持 sdpa/eager")
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument(
+        "--save-total-limit", type=int, default=2,
+        help="最多保留几个 step checkpoint（epoch checkpoint 不受限）。"
+             "每个 ckpt 约 4.3GB，全量 batch=8 一个 epoch 有 5 万多步，"
+             "save-every=500 就是 108 个 = 约 470GB —— 不限量必写爆磁盘",
+    )
+    parser.add_argument(
         "--save-every", type=int, default=0,
-        help="每 N 步存一次（0=只在 epoch 末存）。43.5w 条即使 batch=8 一个 epoch "
-             "也是小时级，中途崩就丢整个 epoch，全量训练务必设上",
+        help="每 N 个 micro-batch 步存一次（0=只在 epoch 末存）。注意计的是 "
+             "dataloader 步、不是优化器步，grad_accum>1 时两者差 grad_accum 倍。"
+             "43.5w 条即使 batch=8 一个 epoch 也是小时级，中途崩就丢整个 epoch",
     )
     parser.add_argument(
         "--length-bucket", type=int, default=64,
@@ -217,7 +224,11 @@ def _save(accelerator, model, args, MODEL_PATH, tag):
     if accelerator.is_main_process:
         name = f"checkpoint-epoch-{tag}" if isinstance(tag, int) else f"checkpoint-{tag}"
         out_dir = os.path.join(args.output_model_path, name)
-        shutil.copytree(MODEL_PATH, out_dir, dirs_exist_ok=True)
+        # 只拷 config/tokenizer 等小文件，跳过权重 —— 权重下面会重新写。
+        # 原先无条件 copytree 整个目录，每次白搬约 3.4GB 再被覆盖，
+        # 全量下每次保存约 8GB I/O。
+        shutil.copytree(MODEL_PATH, out_dir, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("*.safetensors", "*.bin", "*.pt"))
 
         # 保持 voice_design —— 官方脚本这里硬写 custom_voice，产出的 ckpt 会被
         # qwen3_tts_model.py:686 的 != "voice_design" 直接拒掉
@@ -246,6 +257,18 @@ def _save(accelerator, model, args, MODEL_PATH, tag):
             os.remove(idx)
         save_file(sd, os.path.join(out_dir, "model.safetensors"),
                   metadata={"format": "pt"})
+
+        # 滚动清理旧的 step checkpoint（epoch checkpoint 保留）
+        if not isinstance(tag, int) and args.save_total_limit > 0:
+            root = args.output_model_path
+            steps = sorted(
+                (d for d in os.listdir(root)
+                 if d.startswith("checkpoint-step") and os.path.isdir(os.path.join(root, d))),
+                key=lambda d: int(d[len("checkpoint-step"):] or 0),
+            )
+            for old in steps[: -args.save_total_limit]:
+                shutil.rmtree(os.path.join(root, old), ignore_errors=True)
+                accelerator.print(f"清理旧 ckpt {old}")
         accelerator.print(f"已保存 {out_dir}")
 
 

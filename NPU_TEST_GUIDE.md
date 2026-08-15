@@ -689,9 +689,16 @@ DTYPE=fp32 ATTN=sdpa \
 bash run_v2_npu_debug.sh
 ```
 
-启动脚本已透传 `SAVE_EVERY`（默认 **500** 步存一次）与 `LENGTH_BUCKET`（默认 64）。
+启动脚本已透传 `SAVE_EVERY`（默认 **500** 步）与 `LENGTH_BUCKET`（默认 64）。
 19-21 小时的 epoch 中途崩掉，只在 epoch 末落盘等于全丢，所以默认就开着。
-磁盘紧张就调大，但别关。
+
+**磁盘账**（曾因此把 /tmp 撑爆过一次）：batch=8 时一个 epoch 约 5.4 万步，
+`SAVE_EVERY=500` 就是 108 个 checkpoint。故加了两道：
+
+- `--save-total-limit`（默认 **2**）：只保留最近 2 个 step ckpt，epoch ckpt 不受限
+- 保存时 `copytree` 跳过 `*.safetensors` —— 原先每次白搬 3.4GB 权重再被覆盖
+
+**约 470GB → 约 11GB。**
 
 多卡的话先跑一次 `check_ddp_sync.py`（§9.3）确认梯度真的在同步 —— 那个检查在
 NPU 的 HCCL 路径上还没验过。
@@ -701,6 +708,7 @@ NPU 的 HCCL 路径上还没验过。
 | 项 | 正常 | 异常时 |
 |---|---|---|
 | s/step | 1.2-1.4s（batch=8 稳态） | 明显更高 → 看是不是形状没收敛（§12） |
+| 磁盘 | 约 11GB（2 个 step ckpt + epoch ckpt） | 涨个不停 → `--save-total-limit` 没生效 |
 | loss 趋势 | **比前 20 步与后 20 步的均值**，别看首末单点 | 几百步不降 → 见 §8.5 |
 | 显存 | 约 25GiB + 激活 | OOM → 降 batch |
 
