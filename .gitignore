@@ -22,3 +22,9 @@ wheels/
 .vscode/
 venv/
 env/
+# 昇腾算子编译产物与冒烟/数据管线中间产物
+kernel_meta/
+fusion_result.json
+finetuning/scripts/fusion_result.json
+finetuning/data_v2_smoke/
+data_v2_smoke/
