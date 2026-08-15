@@ -235,7 +235,7 @@ def s3_load(model_path, attn):
 # ---------------------------------------------------------------- 4 音频 tokenizer
 
 
-def s4_codes(model_path, workdir, real_jsonl=None):
+def s4_codes(model_path, workdir, real_jsonl=None, n_synth=8):
     stage(4, "音频 tokenizer（抽 audio_codes）")
     import numpy as np
     import soundfile as sf
@@ -260,7 +260,7 @@ def s4_codes(model_path, workdir, real_jsonl=None):
             ("导航到公司", "用户发出明确的导航请求；指令简短清晰，为对车机发令。"),
             ("咱这是往哪走", "用户使用咱字，属于与乘客聊天商量；非对车机助手的指令。"),
         ]
-        for i in range(8):
+        for i in range(n_synth):
             text, ins = cases[i % len(cases)]
             p = os.path.join(wd, f"s{i}.wav")
             t = np.arange(int(2.5 * 16000)) / 16000
@@ -377,7 +377,9 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps, dtype="fp3
     log(f"  $ {cmd}\n")
     import subprocess
 
+    t0 = time.time()
     p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    wall = time.time() - t0
     tail = (p.stdout or "")[-3000:]
     for line in tail.strip().split("\n")[-25:]:
         log(f"  | {line}")
@@ -396,6 +398,7 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps, dtype="fp3
     if len(losses) < 2:
         return fail("没解析到 loss", "训练可能没真正开始")
     ok(f"loss {losses[0]:.4f} → {losses[-1]:.4f}（{len(losses)} 步）")
+    ok(f"训练总耗时 {wall:.1f}s（含加载/编译），约 {wall / len(losses):.1f}s/step")
     if losses[-1] >= losses[0]:
         warn("loss 没下降。步数太少时正常；若几百步仍不降且用的是 --dtype bf16，"
              "换 --dtype fp32 再试（bf16 下 Adam 动量也是 bf16，更新易下溢）")
@@ -490,6 +493,8 @@ def main():
     ap.add_argument("--steps", type=int, default=6)
     ap.add_argument("--dtype", choices=["bf16", "fp32"], default="fp32")
     ap.add_argument("--real_jsonl", default=None, help="用真实数据（含 audio/text/instruct）")
+    ap.add_argument("--synthetic_count", type=int, default=8,
+                    help="合成样本条数。阶段 6 一个 epoch 只有 N 步，要跑 --steps 200 就传 256")
     ap.add_argument("--codes_jsonl", default=None,
                     help="已抽好 audio_codes 的 jsonl，给定则跳过阶段 4。"
                          "音频 tokenizer 在 NPU 上跑不动时，可先在 CPU 上抽好再用这个")
@@ -534,7 +539,8 @@ def main():
         if 4 in want:
             ran.add(4)   # 给了 --codes_jsonl 也视为已满足（用户自带产物）
             if not args.codes_jsonl:
-                state["codes"] = s4_codes(args.model_path, wd, args.real_jsonl)
+                state["codes"] = s4_codes(args.model_path, wd, args.real_jsonl,
+                                          n_synth=args.synthetic_count)
                 if not state["codes"]:
                     failed.append(4)
                     raise SystemExit

@@ -430,25 +430,31 @@ done
 
 | ATTN | 20 步耗时 | 峰值显存（npu-smi） | 实测 |
 |---|---|---|---|
-| sdpa | | | |
-| eager | | | |
+| sdpa | | | 近似版（合成数据 20 步）119.8s |
+| eager | | | 近似版（合成数据 20 步）119.1s |
 
-sdpa 不比 eager 快就说明没走融合 kernel，按快的那个定 §4 的默认值。
+**近似版已跑（2026-08-16，合成数据）**：20 步粒度 sdpa/eager 无差异（119.8s vs
+119.1s，均含加载与编译预热）。但 20 步太短、编译占比大，分辨不出真实差异；
+9.5 的 200 步 sdpa 稳态是 1.0s/step，等真实数据就绪后按上面命令补正式版对比
+（正式版务必加 `SKIP_PREPARE=1 TRAIN_JSONL=<绝对路径>`，避免每次重抽码）。
 
 ### 9.5 收敛趋势（对应 §8.5）—— *之后*
 
 默认 `--dtype fp32` 已规避 bf16 的下溢风险，但仍要确认 loss 是真降不是抖：
 
 ```bash
-python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
+# 合成数据版必须带 --synthetic_count：训练脚本 --num_epochs 1，
+# 默认 8 条合成样本一个 epoch 只有 8 步，--steps 200 根本到不了 200
+python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200 --synthetic_count 256
 ```
 
 | 项 | 实测 |
 |---|---|
-| 200 步 loss 首 / 中 / 末 | |
-| 单步耗时 | |
+| 200 步 loss 首 / 中 / 末 | ✅ 3.6260 → 1.1135（2026-08-16，合成 256 条；中值未采集，正式版日志里留） |
+| 单步耗时 | ✅ 约 1.0s/step（200 步总耗时 192.8s 含加载编译） |
 
-有余力再跑一次 `--dtype bf16` 对比，能直接回答 §8.5。
+loss 从 3.6 降到 1.1，**确认在真降不是抖**——bf16 之外的收敛路径风险基本排除，
+`--dtype fp32` 默认值可以放心用。有余力再跑一次 `--dtype bf16` 对比，能直接回答 §8.5。
 
 ### 9.6 定正式训练的规模 —— *之后*
 
@@ -504,6 +510,23 @@ python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
    - 另：两次实测时长差 10.5% vs 82.6%，`do_sample=True` 随机性大，
      阶段 8 的时长差判据只能当弱信号，腔调对不对最终以听辨为准。
    （sox CLI 缺失的告警无害——python sox 包可用，12Hz 链路不依赖 CLI。）
+
+6. **真实数据现状（2026-08-16 对照 MiMo 仓库 data_report.md 实测）**：
+   - 三份拒识打标 jsonl 与旧报告**完全一致**：行数 99,231 / 120,462 / 277,087
+     （合计 496,780）、schema 25 字段、每集抽样 3000 条 wav 命中 100%、
+     5月批次扁平池 `car_all_0415_0424_wavs` 753,287 个 wav 精确一致。
+   - **报告之后新增**：`duplex_whj_data/CC_new_0601_0630_wavs`（147,190）与
+     `CC_new_0701_0730_wavs`（179,939）两个抽取好的扁平池（抽样 100% 命中，
+     建议作为 V2 数据管线的 wav 来源）；数据源扩到 ~10 个
+     （car_all_0719_0731、70w_see_glass_car_0626×3、glass、seeworld、phone、
+     mingchen_synthetic 等）；`processed_train_0805/` 下已有 1,466,798 条的
+     拒识检测多轮训练集（Qwen-VL 格式，lineage 完整，音频路径是集群
+     `/opt/huawei/dataset/...`）。
+   - 本仓库 V2 管线的消费入口是 `finetuning/prepare_v2_data.py`
+     （打标 jsonl + 扁平 wav 池 → `{audio, text, instruct}` + VAD 切静音），
+     三份数据直接可用。建议先 `--limit 100` sanity check 再全量
+     （全量 43.5 万条 VAD 预计数小时，`--skip-existing` 断点续跑；
+     全量 trimmed wav 约 50-60GB）。
 
 
 ## 附：已知会失败的地方（已在代码里处理，列出来备查）
@@ -608,5 +631,17 @@ python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
    冒烟 s3/s4/s8 与 prepare_data.py 改为 CPU 加载 + `.to("npu:0")`
 4. 芯片型号 910B2 → **910B1**（npu-smi 与 torch 实测），NPU_ENV.md 同步更正
 5. 阶段 8 推理慢：定位为「speech_tokenizer 普通属性没被 .to() 搬到 NPU（decode 留
-   CPU）」+「逐 token 动态形状 aclnn 编译预热」。前者已修（冒烟 s8），后者实测
-   首次 348s / 二次 60s（缓存命中），记入 §10.5 待 9.4/9.5 复测
+   CPU）」+「逐 token 动态形状 aclnn 编译预热」。前者已修（冒烟 s8，后由远程
+   agent 升级为 modeling_qwen3_tts.py 的 to() 覆写，一处修好所有调用点），
+   后者实测首次 348s / 二次 60s（缓存命中），记入 §10.5 待 9.4/9.5 复测
+
+### 五轮：9.4/9.5 实测 + 真实数据核对（2026-08-16）
+
+1. 冒烟脚本加 `--synthetic_count`（阶段 6 一个 epoch 只有 N 步，`--steps 200`
+   配默认 8 条合成样本实际只跑 8 步）+ 阶段 6 计时（s/step）
+2. 9.5 跑通：200 步 loss 3.63 → 1.11（确认收敛，fp32 默认可用），稳态约 1.0s/step
+3. 9.4 近似版（合成数据 20 步）：sdpa 119.8s vs eager 119.1s 无差异，正式版
+   待真实数据
+4. 三份真实拒识打标数据与 MiMo 仓库 data_report.md 逐项核对：核心结论仍成立
+   （行数/schema/wav 100% 在位），但新增了 CC 两个扁平 wav 池、~7 个新数据源、
+   processed_train_08xx 多轮训练线——详情见 §10.6
