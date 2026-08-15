@@ -308,6 +308,108 @@ def s4_codes(model_path, workdir, real_jsonl=None, n_synth=8):
     return out
 
 
+# ------------------------------------------------------------ 4b 真实数据准备链路
+
+
+def s4b_pipeline(model_path, workdir, device, n=12):
+    """走**生产路径** prepare_v2_data.py → prepare_data.py。
+
+    阶段 4 是自己造 wav 直接调 tokenizer，绕开了整个数据准备脚本。而那两个脚本
+    （VAD、一致性筛选、疑似清单、断点续跑、编码）改动最多却从没在昇腾上跑过，
+    §11.1 是手工跑的、不在冒烟里。这一阶段把它们纳入回归。
+    """
+    stage("4b", "真实数据准备链路（prepare_v2_data.py → prepare_data.py）")
+    import subprocess
+
+    import numpy as np
+    import soundfile as sf
+
+    ft = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    wd = os.path.join(workdir, "pipe")
+    wavd = os.path.join(wd, "wavs")
+    os.makedirs(wavd, exist_ok=True)
+
+    # 造打标 jsonl（真实 schema）+ wav：含首尾静音、一条标签不一致、一条纯底噪
+    rng = np.random.default_rng(3)
+    rows = []
+    for i in range(n):
+        uid = f"{i:032x}"
+        sr = 16000
+        sil = np.zeros(int(0.8 * sr), dtype="float32")
+        if i == n - 1:                       # 纯底噪 → 应进"无动态"疑似清单
+            body = (rng.standard_normal(int(2.0 * sr)) * 0.001).astype("float32")
+        else:
+            t = np.arange(int(2.0 * sr)) / sr
+            body = (0.25 * np.sin(2 * np.pi * rng.uniform(120, 200) * t)).astype("float32")
+        sf.write(os.path.join(wavd, f"{uid}.wav"),
+                 np.concatenate([sil, body, sil]), sr, subtype="PCM_16")
+        lab = i % 2
+        rows.append({
+            "uttid": uid, "text": "打开前排车窗" if lab == 0 else "咱这是往哪走",
+            "rej_label": lab,
+            "true_rej_label": 1 - lab if i == 0 else lab,   # 第 0 条标签不一致 → 应被筛掉
+            "evidence": ["用户指令包含明确的车控意图", "音频中用户发音清晰且为近场发令"],
+            "reason": "用户明确发出车窗控制指令，应予响应。",
+        })
+    src = os.path.join(wd, "in.jsonl")
+    with open(src, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    out = os.path.join(wd, "out")
+    r1 = subprocess.run(
+        f"cd {shlex.quote(ft)} && {shlex.quote(sys.executable)} prepare_v2_data.py "
+        f"--dataset smoke {shlex.quote(src)} {shlex.quote(wavd)} "
+        f"--out-dir {shlex.quote(out)} --workers 2 --val-size 2",
+        shell=True, capture_output=True, text=True)
+    if r1.returncode != 0:
+        for line in (r1.stdout or r1.stderr or "")[-1500:].split("\n")[-15:]:
+            log(f"  | {line}")
+        return fail("prepare_v2_data.py 失败", "见上方输出")
+    for line in (r1.stdout or "").split("\n"):
+        if any(k in line for k in ("保留 ", "label_mismatch", "保留比例", "疑似", "无动态")):
+            log(f"  | {line.rstrip()}")
+
+    raw = os.path.join(out, "train_raw.jsonl")
+    if not os.path.exists(raw):
+        return fail("没有产出 train_raw.jsonl")
+    got = [json.loads(l) for l in open(raw, encoding="utf-8")]
+    if any("ref_audio" in g for g in got):
+        return fail("产出里有 ref_audio", "VoiceDesign 不用参考音频")
+    if not all({"audio", "text", "instruct"} <= set(g) for g in got):
+        return fail("字段不全，应为 audio/text/instruct")
+    ok(f"prepare_v2_data.py 通过，产出 {len(got)} 条 {sorted(got[0])}")
+    if os.path.exists(os.path.join(out, "suspicious_vad.jsonl")):
+        ok("suspicious_vad.jsonl 已生成（纯底噪样本应在其中）")
+
+    # prepare_data.py：抽码 + 断点续跑
+    codes = os.path.join(wd, "codes.jsonl")
+    cmd = (f"cd {shlex.quote(ft)} && {shlex.quote(sys.executable)} prepare_data.py "
+           f"--device {device} --tokenizer_model_path "
+           f"{shlex.quote(os.path.join(model_path, 'speech_tokenizer'))} "
+           f"--input_jsonl {shlex.quote(raw)} --output_jsonl {shlex.quote(codes)}")
+    r2 = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if r2.returncode != 0:
+        for line in (r2.stdout or r2.stderr or "")[-1500:].split("\n")[-15:]:
+            log(f"  | {line}")
+        return fail("prepare_data.py 失败",
+                    "NPU 上 --device 必须是 npu:N；若是算子不支持，试 --device cpu")
+    n_all = sum(1 for _ in open(codes, encoding="utf-8"))
+    ok(f"prepare_data.py 通过，抽码 {n_all} 条")
+
+    # 截断一半再跑，验断点续跑
+    keep = max(1, n_all // 2)
+    lines = open(codes, encoding="utf-8").readlines()[:keep]
+    with open(codes, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    r3 = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    n2 = sum(1 for _ in open(codes, encoding="utf-8"))
+    if r3.returncode != 0 or n2 != n_all:
+        return fail(f"断点续跑异常：截断到 {keep} 后补齐得 {n2}，应为 {n_all}")
+    ok(f"断点续跑正确（截断到 {keep} → 补齐 {n_all}）")
+    return codes
+
+
 # ---------------------------------------------------------------- 5 序列布局
 
 
@@ -362,8 +464,9 @@ def s5_layout(model_path, codes_jsonl, language):
 # ---------------------------------------------------------------- 6 前反向
 
 
-def s6_train(model_path, codes_jsonl, workdir, attn, language, steps, dtype="fp32"):
-    stage(6, f"前反向（{steps} 步，看 loss 是否真的在降）")
+def s6_train(model_path, codes_jsonl, workdir, attn, language, steps,
+             dtype="fp32", batch=1, bucket=64, save_every=0):
+    stage(6, f"前反向（{steps} 步，batch={batch}，bucket={bucket}）")
     ft = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out = os.path.join(workdir, "ckpt")
     # 用 sys.executable：昇腾 conda 里不保证有 "python" 这个名字，命中时
@@ -371,9 +474,10 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps, dtype="fp3
     cmd = (f"cd {shlex.quote(ft)} && {shlex.quote(sys.executable)} sft_12hz_voicedesign.py "
            f"--init_model_path {shlex.quote(model_path)} "
            f"--train_jsonl {shlex.quote(codes_jsonl)} "
-           f"--output_model_path {shlex.quote(out)} --batch_size 1 --grad_accum 1 "
+           f"--output_model_path {shlex.quote(out)} --batch_size {batch} --grad_accum 1 "
            f"--num_epochs 1 --max_steps {steps} --log_every 1 "
-           f"--attn {attn} --language {language} --dtype {dtype} 2>&1")
+           f"--attn {attn} --language {language} --dtype {dtype} "
+           f"--length-bucket {bucket} --save-every {save_every} 2>&1")
     log(f"  $ {cmd}\n")
     import subprocess
 
@@ -404,6 +508,7 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps, dtype="fp3
     head, tail = sum(losses[:k]) / k, sum(losses[-k:]) / k
     ok(f"loss 前 {k} 步均值 {head:.4f} → 后 {k} 步均值 {tail:.4f}（共 {len(losses)} 步；"
        f"首末单点 {losses[0]:.4f}/{losses[-1]:.4f} 仅供参考，单样本噪声大）")
+    ok(f"batch={batch} → {steps / max(dt, 1e-9) * batch:.1f} 样本/秒")
     ok(f"训练总耗时 {wall:.1f}s（含加载/编译），约 {wall / len(losses):.1f}s/step")
     if tail >= head:
         warn("loss 均值没下降。注意 batch=1 且样本数 < 步数时，一个 epoch 内每条只见"
@@ -500,6 +605,9 @@ def main():
     ap.add_argument("--language", default="Chinese")
     ap.add_argument("--steps", type=int, default=6)
     ap.add_argument("--dtype", choices=["bf16", "fp32"], default="fp32")
+    ap.add_argument("--batch", type=int, default=1, help="阶段 6 的 batch_size")
+    ap.add_argument("--bucket", type=int, default=64, help="阶段 6 的 --length-bucket")
+    ap.add_argument("--save-every", type=int, default=0, help="阶段 6 的 --save-every")
     ap.add_argument("--real_jsonl", default=None, help="用真实数据（含 audio/text/instruct）")
     ap.add_argument("--synthetic_count", type=int, default=8,
                     help="合成样本条数。阶段 6 一个 epoch 只有 N 步，要跑 --steps 200 就传 256")
@@ -507,6 +615,11 @@ def main():
                     help="已抽好 audio_codes 的 jsonl，给定则跳过阶段 4。"
                          "音频 tokenizer 在 NPU 上跑不动时，可先在 CPU 上抽好再用这个")
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--device", default="npu:0", help="阶段 4b 传给 prepare_data.py")
+    ap.add_argument("--skip-pipeline", action="store_true",
+                    help="跳过阶段 4b（生产数据准备链路）")
+    ap.add_argument("--use-pipeline-codes", action="store_true",
+                    help="后续阶段用 4b 产出的 codes，而非阶段 4 的")
     ap.add_argument("--report", default="npu_smoke_report.txt")
     args = ap.parse_args()
 
@@ -559,7 +672,9 @@ def main():
         if 6 in want and state["codes"]:
             ran.add(6)
             state["ckpt_root"] = s6_train(args.model_path, state["codes"], wd,
-                                          args.attn, args.language, args.steps, args.dtype)
+                                          args.attn, args.language, args.steps,
+                                          args.dtype, args.batch, args.bucket,
+                                          args.save_every)
             if not state["ckpt_root"]:
                 failed.append(6)
                 raise SystemExit

@@ -110,7 +110,8 @@ pip 走华为内部镜像（`pip.conf` 已配好）。
 | **1** | bf16 matmul、显存查询 | CANN 与 torch_npu 版本不配套 |
 | **2** | `sdpa` vs `eager` 能否跑 + 相对耗时 | sdpa 不可用 → 启动脚本传 `ATTN=eager` |
 | **3** | VoiceDesign 权重加载到 NPU | 若报 flash_attention_2 → 传 `--attn sdpa` |
-| **4** | 抽 `audio_codes`（`prepare_data.py` 那一步） | 音频 tokenizer 有算子不支持 → 这步放 CPU 跑 |
+| **4** | 抽 `audio_codes`（直接调 tokenizer） | 音频 tokenizer 有算子不支持 → 这步放 CPU 跑 |
+| **4b** | **走生产路径**：`prepare_v2_data.py` → `prepare_data.py`，含断点续跑 | 数据准备链路在 NPU 上不通 |
 | **5** | 序列布局与推理侧逐格核对（纯 CPU） | **最要命的一类**，见 §5 |
 | **6** | 若干步前反向，看 loss | OOM → 降 batch；算子不支持 → 换 eager |
 | **7** | ckpt 完整性 | 缺文件 / 残留 index.json / model_type 不对 |
@@ -813,6 +814,58 @@ sub-talker 的 hidden 位置与推理 `past_hidden` 语义一致、
 **第 1、2 步优先**——`--ref-percentile` 要不要动、能不能放心跑全量，全看那两个数。
 第 3 步是这轮代码改动里唯一没在 NPU 上验过的（分桶只在 CUDA 上确认了形状收敛
 12 种 → 1 种，实际提速多少只有昇腾能测）。
+
+
+## 15. 冒烟测试的覆盖缺口（已补，2026-08-16）
+
+之前的冒烟（阶段 0-8）**没有覆盖改动最多的那部分**：阶段 4 是自己造 wav 直接调
+tokenizer，**绕开了 `prepare_v2_data.py` 和 `prepare_data.py` 这两个脚本**。
+而 §11.1 是手工跑的、不在冒烟里 —— 也就是说整条数据准备链路改完之后，
+在昇腾上一次都没再跑过。
+
+补了 **阶段 4b**：造 12 条带真实 schema 的打标 jsonl + wav（含首尾静音、
+一条标签不一致、一条纯底噪），走完整生产路径并校验：
+
+- `prepare_v2_data.py` 跑通，标签不一致的被筛掉、产出字段是
+  `{audio, text, instruct}` 且**无 `ref_audio`**、`suspicious_vad.jsonl` 生成
+- `prepare_data.py` 抽码跑通
+- **断点续跑**：截断一半后重跑能正确补齐
+
+开发机（CUDA 代替 npu 设备）实测通过：12 → 11 条（筛掉 1 条标签不一致），
+截断到 5 → 补齐 10。
+
+同时给阶段 6 加了 `--batch` / `--bucket` / `--save-every`，
+这三样此前也从未被冒烟覆盖（batch 写死 1、bucket 只用默认、save-every 全无）。
+
+### 15.1 现在能一条命令跑完的
+
+```bash
+cd finetuning/scripts && . ./npu_env.sh
+python npu_smoke_test.py --model_path <VoiceDesign>          # 0-8 含 4b
+```
+
+### 15.2 §12.6 的提速对比现在也能用冒烟跑
+
+```bash
+for BK in 1 64; do
+  python npu_smoke_test.py --model_path <VoiceDesign> --codes_jsonl <codes> \
+    --stages 6 --steps 50 --bucket $BK --report /tmp/bk_$BK.txt
+done
+for BS in 1 4 8; do
+  python npu_smoke_test.py --model_path <VoiceDesign> --codes_jsonl <codes> \
+    --stages 6 --steps 50 --batch $BS --report /tmp/bs_$BS.txt
+done
+```
+
+阶段 6 现在会打「N 样本/秒」，直接填 §12.6 的表。
+
+### 15.3 仍未被冒烟覆盖的
+
+| 项 | 为什么 | 怎么办 |
+|---|---|---|
+| 多卡 DDP 梯度同步 | 需要 torchrun 多进程，不适合塞进单进程冒烟 | 单独跑 `check_ddp_sync.py`（§9.3） |
+| 真实 43.5w 条的规模行为 | 冒烟是小样本 | §11 分三步做 |
+| 批量合成（推理侧）的吞吐 | V2 训练完才需要 | 那时再说 |
 
 
 ## 附：已知会失败的地方（已在代码里处理，列出来备查）
