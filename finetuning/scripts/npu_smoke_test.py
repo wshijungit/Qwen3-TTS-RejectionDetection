@@ -397,10 +397,18 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps, dtype="fp3
                 pass
     if len(losses) < 2:
         return fail("没解析到 loss", "训练可能没真正开始")
-    ok(f"loss {losses[0]:.4f} → {losses[-1]:.4f}（{len(losses)} 步）")
+    # 不能比首末两个单点：batch_size=1 时每步是**单样本** loss。实测同配置的
+    # 真实数据跑了两次，首末分别是 3.33→3.02 和 3.61→3.72（一降一升），
+    # 而两次尾段均值都是 4.0 上下、标准差约 0.62 —— 首末点差纯属噪声。
+    k = max(3, min(20, len(losses) // 4))
+    head, tail = sum(losses[:k]) / k, sum(losses[-k:]) / k
+    ok(f"loss 前 {k} 步均值 {head:.4f} → 后 {k} 步均值 {tail:.4f}（共 {len(losses)} 步；"
+       f"首末单点 {losses[0]:.4f}/{losses[-1]:.4f} 仅供参考，单样本噪声大）")
     ok(f"训练总耗时 {wall:.1f}s（含加载/编译），约 {wall / len(losses):.1f}s/step")
-    if losses[-1] >= losses[0]:
-        warn("loss 没下降。步数太少时正常；若几百步仍不降且用的是 --dtype bf16，"
+    if tail >= head:
+        warn("loss 均值没下降。注意 batch=1 且样本数 < 步数时，一个 epoch 内每条只见"
+             "一次，本就不该有可见收敛——要看收敛请固定小样本集跑多个 epoch。"
+             "若几百步仍不降且用的是 --dtype bf16，"
              "换 --dtype fp32 再试（bf16 下 Adam 动量也是 bf16，更新易下溢）")
     return out
 

@@ -48,8 +48,9 @@ import soundfile as sf
 # 必须 spawn：fork 的 worker 里首次触发 numba JIT（librosa.effects.trim）会在本机
 # aarch64 上崩 —— llvmlite 的 RuntimeDyldELF 报 relocation overflow
 # （`Assertion 'isInt<33>(Result)' failed`，进程 SIGABRT，整个池 BrokenProcessPool）。
-# 主进程 JIT 正常，spawn 后各 worker 是全新解释器，不受 fork 继承的内存布局影响。
-# 代价是每建一次池要重新 import（16 worker × ~2s），全量 22 个分块约多 12 分钟。
+# 防御性：librosa 移出本文件后已无已知必要性，但 spawn 的子进程是全新
+# 解释器，不继承父进程的地址空间布局，对这类 JIT/动态库问题更稳。
+# 实测启动开销约 0.1-0.3s/worker，相对全量耗时可忽略。
 _MP_CTX = multiprocessing.get_context("spawn")
 
 # ---------------------------------------------------------------- 常量
@@ -85,6 +86,20 @@ PRE_VAD_DROPS = {"wav_not_found", "wav_read_fail"}
 CHUNK = 20000
 
 PUNCT = "。；;，,、 \t\r\n"
+
+# 保留比例低于此值即视为「疑似过切」，单独列入报告供人工抽听。
+# 只统计不丢弃 —— 音频预处理只做 VAD，不加别的过滤。
+SUSPICIOUS_KEEP = 0.25
+
+# energy VAD 的 dB 参考分位。100 = 用最大帧作参考，与 librosa.effects.trim 一致，
+# 是默认行为。已知的失效模式：**任何强瞬态**（关门、喇叭、碰麦…）会把参考值抬高，
+# 使真正的人声整体落到 (ref - top_db) 之下被当静音掐掉——合成信号实测，
+# 6.09s 片段含一声尖峰时 top_db=30 下只剩 0.38s，而 0.38 > --min-dur 0.3，
+# 该样本会通过全部检查进训练集，内容却只有那声尖峰。
+#
+# **但真实数据里是否存在这种情况尚无证据**，故默认不改行为，只把证据打出来
+# （报告里的 trimmed_ratio 分位 + 疑似过切计数）。确认有问题再调低此值。
+REF_PERCENTILE = 100.0
 
 
 # ---------------------------------------------------------------- instruct 转写
@@ -155,7 +170,7 @@ def _get_silero(model_path):
     return _SILERO
 
 
-def trim_silence(wav, sr, mode, top_db, silero_path):
+def trim_silence(wav, sr, mode, top_db, silero_path, ref_percentile=None):
     """
     只切首尾静音，不动句中停顿——句中停顿是腔调的一部分。
     返回 (trimmed_wav, 是否检测到人声)
@@ -176,9 +191,13 @@ def trim_silence(wav, sr, mode, top_db, silero_path):
     # （librosa.effects.trim → util.frame）」组合必崩：llvmlite RuntimeDyldELF 报
     # relocation overflow（`Assertion 'isInt<33>(Result)' failed`，SIGABRT）——
     # libsndfile 的加载改变了进程地址空间布局，LLVM JIT 的代码段与全局符号距离
-    # 超过 4GB。主进程/worker、fork/spawn 都不行，与数据无关。
-    # 语义与 librosa.effects.trim 一致（frame 2048 / hop 512）：分帧 RMS → dB →
-    # 掐掉首尾低于 (max_db - top_db) 的帧。
+    # 超过 4GB。改纯 numpy 后本文件已不再 import librosa，该路径彻底避开。
+    # 分帧 RMS → dB → 掐掉首尾低于阈值的帧（frame 2048 / hop 512）。
+    # 与 librosa.effects.trim 的两处已知差异：
+    #   ① librosa 的 rms 默认 center=True（首尾补零、帧以 i*hop 为中心），
+    #      本实现是非居中分帧，故首尾各多留 1024 样点（区间恒为 librosa 的超集，
+    #      只会切得更少、不会更多）；
+    #   ② 参考值分位可调（默认 100 = max，与 librosa 相同）。
     FRAME, HOP = 2048, 512
     if wav.size < FRAME:
         return wav[:0], False
@@ -189,9 +208,17 @@ def trim_silence(wav, sr, mode, top_db, silero_path):
         strides=(wav.strides[0] * HOP, wav.strides[0]),
         writeable=False,
     )
-    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
-    ref_db = 20.0 * np.log10(max(float(rms.max()), 1e-10)) - top_db
-    idx = np.nonzero(20.0 * np.log10(np.maximum(rms, 1e-10)) > ref_db)[0]
+    # 用累积和算逐帧 RMS：frames.astype(float64) 会把 strided view 实体化成
+    # N×2048×8 字节的真拷贝（10 分钟音频 ≈ 300MB/worker，32 worker 会 OOM）。
+    # 数值与逐帧 mean 一致（实测最大绝对误差 5.6e-14，选帧完全相同）。
+    c = np.concatenate(([0.0], np.cumsum(wav.astype(np.float64) ** 2)))
+    rms = np.sqrt((c[FRAME::HOP][:n] - c[0 : n * HOP : HOP]) / FRAME)
+
+    # 参考值分位可调（REF_PERCENTILE / --ref-percentile）。默认 100 = max，与 librosa 一致。
+    # 用 max 时，任何强瞬态都会抬高参考值、把人声整体压到阈值以下（见常量处注释）。
+    db = 20.0 * np.log10(np.maximum(rms, 1e-10))
+    ref_db = float(np.percentile(db, ref_percentile or REF_PERCENTILE)) - top_db
+    idx = np.nonzero(db > ref_db)[0]
     if idx.size == 0:
         return wav[:0], False
     start = int(idx[0]) * HOP
@@ -251,7 +278,8 @@ def process_one(job):
 
         try:
             wav, has_speech = trim_silence(
-                wav, sr, cfg["vad"], cfg["top_db"], cfg["silero_path"]
+                wav, sr, cfg["vad"], cfg["top_db"], cfg["silero_path"],
+                cfg.get("ref_percentile"),
             )
         except Exception:
             return fail("vad_error")
@@ -391,6 +419,7 @@ def vad_fingerprint(args):
     return {
         "vad": args.vad,
         "top_db": args.top_db,
+        "ref_percentile": args.ref_percentile,
         "min_dur": args.min_dur,
         "silero_path": args.silero_path,
     }
@@ -508,6 +537,8 @@ def new_stats():
     s["drop_by_label"] = defaultdict(Counter)  # reason -> Counter{label: n}
     s["dur_before"] = []
     s["dur_after"] = []
+    s["ratios"] = []          # 每条的保留比例 dur_after/dur_before
+    s["suspicious"] = []      # 保留比例 < SUSPICIOUS_KEEP 的 (uttid, before, after, label)
     return s
 
 
@@ -563,6 +594,11 @@ def main():
         help="energy 模式阈值。越小越激进；车内录音背景噪声大，不建议低于 25",
     )
     ap.add_argument("--silero-path", default=None, help="silero-vad 本地仓库路径")
+    ap.add_argument(
+        "--ref-percentile", type=float, default=100.0,
+        help="energy VAD 的 dB 参考分位。默认 100（= 最大帧，与 librosa 一致）。"
+             "若报告里的疑似过切计数偏高，调到 95 可对强瞬态稳健得多",
+    )
     ap.add_argument("--min-dur", type=float, default=0.3, help="VAD 后短于此秒数则丢弃")
     ap.add_argument(
         "--val-size", type=int, default=500, help="验证集条数（至少 1，训练配了 eval_strategy）"
@@ -632,6 +668,7 @@ def main():
             "vad": args.vad,
             "top_db": args.top_db,
             "silero_path": args.silero_path,
+            "ref_percentile": args.ref_percentile,
             "min_dur": args.min_dur,
             "skip_existing": allow_skip,
         }
@@ -672,6 +709,13 @@ def main():
                         stats["kept_by_label"][rec["label"]] += 1
                         stats["dur_before"].append(rec["_dur_before"])
                         stats["dur_after"].append(rec["_dur_after"])
+                        if rec["_dur_before"] > 0:
+                            keep = rec["_dur_after"] / rec["_dur_before"]
+                            stats["ratios"].append(keep)
+                            if keep < SUSPICIOUS_KEEP:
+                                stats["suspicious"].append(
+                                    (rec["uttid"], round(rec["_dur_before"], 2),
+                                     round(rec["_dur_after"], 2), rec["label"]))
             except Exception as e:
                 tail = chunk[chunk_done:]
                 stats["worker_crash"] += len(tail)
@@ -728,6 +772,19 @@ def main():
     with open(os.path.join(args.out_dir, "manifest.jsonl"), "w", encoding="utf-8") as f:
         for m in manifest:
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
+
+    # 疑似过切清单：按保留比例升序，最可疑的排最前，直接拿去抽听
+    susp = [(ds, *t) for ds, st_ in per_ds_stats.items() for t in st_["suspicious"]
+            for ds in (ds,)]
+    if susp:
+        susp.sort(key=lambda r: r[3] / max(r[2], 1e-9))
+        with open(os.path.join(args.out_dir, "suspicious_vad.jsonl"), "w",
+                  encoding="utf-8") as f:
+            for ds, uttid, before, after, label in susp:
+                f.write(json.dumps(
+                    {"dataset": ds, "uttid": uttid, "dur_before": before,
+                     "dur_after": after, "keep": round(after / max(before, 1e-9), 3),
+                     "label": label}, ensure_ascii=False) + "\n")
 
     # ---------------- 统计报告 ----------------
     cfg_dump = dict(vars(args))
@@ -797,6 +854,25 @@ def main():
                 f"  一致性筛选前后 reject 占比（按 gemini 预测标签）  "
                 f"{ps[1] / raw_tot * 100:.1f}% → {post_r / (post_r + post_a) * 100:.1f}%"
             )
+        # VAD 保留比例的分布 + 疑似过切清单。默认参考值是 max，任何强瞬态都会
+        # 把人声压到阈值以下（见 REF_PERCENTILE 注释）；真实数据里是否发生，
+        # 就靠下面这几行看。只统计不丢弃。
+        rr = s["ratios"]
+        if rr:
+            q = np.percentile(rr, [1, 5, 25, 50])
+            d["keep_ratio_p1_p5_p25_p50"] = [round(float(x), 3) for x in q]
+            d["suspicious_count"] = len(s["suspicious"])
+            lines.append(
+                f"  保留比例分位      p1 {q[0]:.2f} | p5 {q[1]:.2f} | "
+                f"p25 {q[2]:.2f} | p50 {q[3]:.2f}"
+            )
+            if s["suspicious"]:
+                by = Counter(lb for *_, lb in s["suspicious"])
+                lines.append(
+                    f"  ⚠ 疑似过切（保留 < {SUSPICIOUS_KEEP:.0%}）{len(s['suspicious']):,} 条"
+                    f"（accept {by[0]:,} / reject {by[1]:,}），已写入 suspicious_vad.jsonl；"
+                    f"抽听几条确认是不是强瞬态锁死了参考值，是就把 --ref-percentile 调到 95"
+                )
         if db and d.get("trimmed_ratio") is not None:
             lines.append(
                 f"  时长 VAD 前/后  {d['dur_before_mean']}s → {d['dur_after_mean']}s"
