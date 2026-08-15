@@ -30,10 +30,15 @@ def main():
     parser.add_argument("--output_jsonl", type=str, required=True)
     args = parser.parse_args()
 
-    tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
-        args.tokenizer_model_path,
-        device_map=args.device,
-    )
+    # 不用 device_map：torch 2.1 + torch_npu 上 meta 快速加载路径会炸
+    # （param[...] → torch.cuda._lazy_init → "Torch not compiled with CUDA enabled"），
+    # 先 CPU 加载，非 CPU 设备再整体搬过去
+    tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(args.tokenizer_model_path)
+    if not str(args.device).startswith("cpu"):
+        import torch
+
+        tokenizer_12hz.model.to(args.device)
+        tokenizer_12hz.device = torch.device(args.device)
 
     total_lines = open(args.input_jsonl).readlines()
     total_lines = [json.loads(line.strip()) for line in total_lines]

@@ -4,10 +4,14 @@
 # 与 debug 版的唯一区别是**分布式与路径来源**，训练代码保持 device 无关。
 # 设备可见性交给 ModelArts 调度，**不要**自设 ASCEND_RT_VISIBLE_DEVICES。
 #
-# 注意：1.7B 全参微调单卡约 27GiB（--dtype fp32 默认），910B2 是 64GB —— 多卡是**为了吞吐**，
+# 注意：1.7B 全参微调单卡约 25GiB（--dtype fp32 默认），910B2 是 64GB —— 多卡是**为了吞吐**，
 # 不是因为放不下。走 accelerate 原生 DDP（数据并行），不需要 FSDP/ZeRO/MindSpeed。
 #
 # backend 写 nccl：torch_npu 会自动映射到 hccl（团队脚本通用写法）。
+#
+# 与参考仓库（duplex_huanyu_qwen35/pretrain_al_cls.sh）的唯一刻意差异是启动器：
+# 它们走 megatron/mindspore 路线用 msrun；本链路是 HF + accelerate，不依赖那一套，
+# torch.distributed.run + torch_npu 的 hccl 后端即可，不必引入 msrun。
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FT_DIR="$(dirname "$HERE")"
@@ -15,6 +19,19 @@ set -euo pipefail   # npu_env.sh 不再设，由各启动脚本自己负责
 . "$HERE/npu_env.sh"
 
 PY=${PY:-python3}
+
+# ---------- 依赖安装（集群容器是干净的，参考仓库也是在脚本内 pip install）----------
+# 必须 --user：base 镜像的 conda 环境里有 root 所有的文件（如 tokenizers 的
+# dist-info），普通 pip 卸载/覆盖会 Permission denied。user site 优先级更高，正好覆盖。
+# transformers 钉 4.55.2 不是 4.57.3：4.56+ 无条件用 torch>=2.2 的
+# torch.utils._pytree.register_pytree_node，在 torch 2.1.0 上 import 即崩（实测）。
+if [ "${SKIP_INSTALL:-0}" != "1" ]; then
+    pip install --user transformers==4.55.2 "accelerate==1.0.0" "safetensors>=0.4.5" \
+        sox onnxruntime einops librosa soundfile "torchaudio==2.1.0" 2>&1 | tail -3
+    pip install --user -e "$FT_DIR" --no-deps 2>&1 | tail -3
+fi
+
+npu-smi info
 
 # ---------- ModelArts 作业变量 ----------
 if [ -n "${MA_VJ_NAME:-}" ]; then
@@ -32,7 +49,8 @@ else
     MASTER_ADDR=127.0.0.1
     echo "=== 非作业环境（DevContainer 调试）==="
 fi
-MASTER_PORT=${MASTER_PORT:-29888}
+MASTER_PORT=${MASTER_PORT:-6411}   # 参考仓库同值
+netstat -tuln | grep ${MASTER_PORT} || echo "端口 ${MASTER_PORT} 空闲"
 
 MODEL_PATH=${MODEL_PATH:-${WORK_ROOT}/quoteModel/Qwen3-TTS-12Hz-1.7B-VoiceDesign}
 TRAIN_JSONL=${TRAIN_JSONL:-${WORK_ROOT}/dataset/duplex_whj_data/v2/train_codes.jsonl}

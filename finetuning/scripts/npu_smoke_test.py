@@ -142,7 +142,7 @@ def s1_ops():
         free, total = torch.npu.mem_get_info(0)
         ok(f"显存 {free / 2**30:.1f} / {total / 2**30:.1f} GiB 可用")
         if total / 2**30 < 32:
-            warn("单卡显存 < 32GB：--dtype fp32 需约 27GiB + 激活，可能偏紧；"
+            warn("单卡显存 < 32GB：--dtype fp32 需约 25GiB + 激活，可能偏紧；"
                  "可改 --dtype bf16（约 12.7GiB），但 Adam 动量也会是 bf16，注意收敛")
     except Exception:
         warn("mem_get_info 不可用，跳过显存检查")
@@ -211,8 +211,13 @@ def s3_load(model_path, attn):
 
     t0 = time.time()
     try:
-        m = Qwen3TTSModel.from_pretrained(model_path, dtype=torch.bfloat16,
-                                          attn_implementation=attn, device_map="npu:0")
+        # 不用 device_map：torch 2.1 + torch_npu 上 meta 快速加载路径会炸
+        # （param[...] → torch.cuda._lazy_init → "Torch not compiled with CUDA enabled"），
+        # 与训练脚本同路线：先 CPU 加载再整体 .to(npu)
+        m = Qwen3TTSModel.from_pretrained(model_path, torch_dtype=torch.bfloat16,
+                                          attn_implementation=attn)
+        m.model.to("npu:0")
+        m.device = torch.device("npu:0")
     except Exception as e:
         return fail(f"加载失败: {type(e).__name__}: {e}",
                     "若是 flash_attention_2 相关，改 --attn sdpa；\n"
@@ -270,9 +275,11 @@ def s4_codes(model_path, workdir, real_jsonl=None):
         ok(f"造了 {len(rows)} 条合成样本")
 
     try:
+        # 同 s3：device_map 在 torch 2.1 + torch_npu 上走 meta 加载路径会炸
         tok = Qwen3TTSTokenizer.from_pretrained(
-            os.path.join(model_path, "speech_tokenizer"),
-            device_map="npu:0")   # 不传 dtype，与生产路径 prepare_data.py 一致
+            os.path.join(model_path, "speech_tokenizer"))   # 不传 dtype，与生产路径一致
+        tok.model.to("npu:0")
+        tok.device = torch.device("npu:0")
     except Exception as e:
         return fail(f"tokenizer 加载失败: {type(e).__name__}: {e}",
                     "确认 speech_tokenizer 子目录存在")
@@ -430,8 +437,11 @@ def s8_infer(ckpt_dir, attn, workdir, language):
     from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
     try:
-        m = Qwen3TTSModel.from_pretrained(ckpt_dir, dtype=torch.bfloat16,
-                                          attn_implementation=attn, device_map="npu:0")
+        # 同 s3：不用 device_map，CPU 加载后整体搬 NPU
+        m = Qwen3TTSModel.from_pretrained(ckpt_dir, torch_dtype=torch.bfloat16,
+                                          attn_implementation=attn)
+        m.model.to("npu:0")
+        m.device = torch.device("npu:0")
     except Exception as e:
         return fail(f"微调后的 ckpt 加载失败: {type(e).__name__}: {e}")
     ok("微调后的 ckpt 可加载")

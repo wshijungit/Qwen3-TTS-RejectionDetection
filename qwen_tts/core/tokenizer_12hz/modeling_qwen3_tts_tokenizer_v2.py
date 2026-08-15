@@ -41,6 +41,15 @@ from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
+# 版本兼容：transformers 4.5x 是裸装饰器 `@check_model_inputs`，4.57+ 是工厂
+# `@check_model_inputs()`。本机 torch 2.1.0 只能用 4.55.x（4.56+ 无条件用
+# torch>=2.2 的 torch.utils._pytree.register_pytree_node），故两种都支持：
+try:
+    check_model_inputs()
+    _check_model_inputs = check_model_inputs()   # 工厂形式
+except TypeError:
+    _check_model_inputs = check_model_inputs      # 裸装饰器形式
+
 from .configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
     Qwen3TTSTokenizerV2DecoderConfig,
@@ -496,7 +505,7 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
+    @_check_model_inputs
     @auto_docstring
     def forward(
         self,

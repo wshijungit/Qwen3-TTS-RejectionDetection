@@ -30,6 +30,10 @@ else
     return 1 2>/dev/null || exit 1   # 被 source 时 return，直接执行时 exit
 fi
 export ASCEND_TOOLKIT_HOME="${ASCEND_HOME_PATH}"
+# 参考仓库（duplex_huanyu_qwen35）在 source CANN 后还会显式补这两条：
+# 本地 set_env_local.sh 不保证设全；集群 set_env.sh 已设，重复无害
+export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/lib64/stub:${LD_LIBRARY_PATH:-}"
+export PATH="${ASCEND_HOME_PATH}/bin:${PATH}"
 # 注：nnal/atb/set_env.sh 是 MindSpeed 作业才需要的，HF 路线不用 source
 
 # ---------- 2. 昇腾调优 / 日志 ----------
@@ -51,6 +55,7 @@ export OMP_NUM_THREADS=1
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-3600}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-7200}
 export MS_NODE_TIMEOUT=${MS_NODE_TIMEOUT:-3600}
+export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-64111}   # 参考仓库同值
 
 # ---------- 4. 预检 ----------
 npu_preflight() {

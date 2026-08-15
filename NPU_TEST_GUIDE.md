@@ -1,6 +1,6 @@
 # V2 链路 NPU 上机测试指南
 
-> 分支 `v2_exp`。目标：在昇腾 910B2 上验证 V2 VoiceDesign 微调链路能跑通。
+> 分支 `v2_exp`。目标：在昇腾 910B1 上验证 V2 VoiceDesign 微调链路能跑通。
 >
 > 全部代码在 CUDA（H200）上端到端验证过，**NPU 侧有三处我在开发机上验证不了**，
 > 这份测试就是为了把它们打掉。
@@ -40,15 +40,17 @@ exp_avg (m) / exp_avg_sq (v)   : bfloat16      <- Adam 两个动量也是 bf16
 累积梯度平方，lr 2e-5 下更新量下溢的风险比原先判断的大。
 
 **因此 `--dtype` 默认已改为 `fp32`**（fp32 权重 + autocast bf16 计算，约 25GiB）。
-910B2 是 64GB，完全吃得下，没有理由为省显存冒收敛风险。显存真紧再传 `--dtype bf16`。
+910B1 是 64GB，完全吃得下，没有理由为省显存冒收敛风险。显存真紧再传 `--dtype bf16`。
 
 > 附带修掉的一个坑：训练循环原先直接调 `model.talker(...)`，**绕过了被 accelerate
 > `prepare` 的模块的 forward**，导致 autocast 完全不生效（fp32 时就是纯 fp32 跑，
 > 慢数倍）、多卡时 DDP 梯度也**完全不同步**（每张卡各训各的，不报错、loss 照降）。
 > 现已把整个计算封进 `V2TrainStep.forward`，两者一并解决。
 
-另有一个已知必踩项：**`transformers` 在那台机器上没装**（`NPU_ENV.md §2` 确认）。
-`pyproject` 要求 4.57.3，其 `requires-python >=3.9.0`，py3.9 可以装。
+另有一个已知必踩项：**`transformers` 在那台机器上没装**（`NPU_ENV.md §2` 确认），
+且**不能照 pyproject 装 4.57.3**——上机实测 4.56+ 无条件调用 torch>=2.2 的
+`torch.utils._pytree.register_pytree_node`，torch 2.1.0 上 `import transformers`
+即崩（§8.2 已回填实测结论）。现役版本钉 **4.55.2**。
 
 ---
 
@@ -57,10 +59,15 @@ exp_avg (m) / exp_avg_sq (v)   : bfloat16      <- Adam 两个动量也是 bf16
 昇腾现役 conda `PyTorch-2.1.0`（py3.9）里缺 `transformers` 和 `qwen_tts`：
 
 ```bash
-pip install transformers==4.57.3          # requires-python >=3.9.0，py3.9 可用
-pip install -e . --no-deps                # 装 qwen_tts（在仓库根目录），必须 --no-deps
-pip install sox onnxruntime einops "torchaudio==2.1.0"   # --no-deps 漏掉的运行时依赖
+pip install --user transformers==4.55.2   # 4.57.3 在 torch 2.1.0 上 import 即崩，见 §8.2
+pip install --user -e . --no-deps         # 装 qwen_tts（在仓库根目录），必须 --no-deps
+pip install --user sox onnxruntime einops "torchaudio==2.1.0"   # --no-deps 漏掉的运行时依赖
 ```
+
+**必须 `--user`（实测）**：base 镜像的 conda 环境里有 root 所有的文件（如
+tokenizers 的 dist-info），普通 `pip install` 卸载/覆盖时报
+`Permission denied: 'METADATA'`。user site-packages 优先级高于环境目录，正好覆盖；
+这也是参考仓库脚本对 zarr/mindspore 用 `--user` 的原因。
 
 **第三条不能省。** `--no-deps` 只装了 qwen_tts 本身，而 `import qwen_tts` 的依赖链是：
 
@@ -75,8 +82,7 @@ qwen_tts/__init__ → inference/qwen3_tts_model → core/__init__
 
 `torchaudio` **必须钉 2.1.0** —— 不钉版本 pip 会拉最新的，其依赖精确钉死
 `torch==2.x`，会把机器上的 torch 2.1.0 顶掉、连带废掉 torch_npu。
-（aarch64 wheel 可用性需上机确认；装不上的话，把 `qwen_tts/core/__init__.py` 里
-25Hz tokenizer 的 import 改成惰性加载亦可——本链路走 12Hz，根本用不到它。）
+（**实测**：本机环境里已有 torchaudio 2.1.0（aarch64），§8.1 阻塞项解除。）
 
 **`pip install -e .` 必须带 `--no-deps`**，两个原因：
 1. pyproject 钉了 `accelerate==1.12.0`，它要求 py≥3.10，py3.9 下 pip 直接解析失败；
@@ -88,8 +94,7 @@ qwen_tts/__init__ → inference/qwen3_tts_model → core/__init__
 `clip_grad_norm_` / `prepare` / `unwrap_model` / `is_main_process`），阶段 0 会逐个校验。
 
 其余运行依赖（safetensors / librosa / soundfile 等）NPU_ENV.md §2 确认已装。
-`pip install transformers==4.57.3` 会连带装 huggingface_hub/tokenizers；py3.9 下
-若 tokenizers 解析失败，退回 transformers 4.5x 的 py3.9 组合，阶段 0 会验 import。
+transformers 4.55.2 连带 tokenizers 0.21.4（实测可用），阶段 0 会验 import。
 
 pip 走华为内部镜像（`pip.conf` 已配好）。
 
@@ -141,14 +146,22 @@ python npu_smoke_test.py --model_path ... --stages 5-6 \
 冒烟过了之后：
 
 ```bash
-# 单卡 debug
+# 单卡 debug（数据走默认路径 $FT_DIR/data_v2/train_{raw,codes}.jsonl）
 cd finetuning/scripts
-MODEL_PATH=/path/VoiceDesign RAW_JSONL=./data_v2/train_raw.jsonl \
-  bash run_v2_npu_debug.sh
+MODEL_PATH=/path/VoiceDesign bash run_v2_npu_debug.sh
+# 要覆盖数据路径请传绝对路径：脚本里 RAW_JSONL/TRAIN_JSONL 会 realpath，
+# 相对路径按脚本启动目录（finetuning/scripts）解析，不是 $FT_DIR
 
 # ModelArts 集群（作业变量由平台注入）
 bash run_v2_npu_cluster.sh
 ```
+
+两个启动脚本都**内置依赖安装**（§2 三条 + accelerate/safetensors/librosa/soundfile
+钉版本），`SKIP_INSTALL=1` 可跳过——与参考仓库 `duplex_huanyu_qwen35/pretrain_al_cls.sh`
+的「脚本内 pip install」惯例一致，集群容器是干净的。启动器用 `torch.distributed.run`
+而非参考仓库的 `msrun`：本链路不依赖 megatron/mindspore，torch_npu 的 hccl 后端
+直接可用（这是与参考仓库唯一刻意保留的差异）。端口约定对齐参考仓库：
+`MASTER_PORT=6411`、`HCCL_IF_BASE_PORT=64111`。
 
 **1.7B 全参微调单卡就够**，两种精度实测（开发机 H200，均跑通并落盘）：
 
@@ -162,7 +175,7 @@ bash run_v2_npu_cluster.sh
 
 正式训练也可用 `DTYPE=bf16 bash run_v2_npu_debug.sh` 切换。
 
-910B2 是 64GB，默认的 fp32 完全吃得下。集群多卡只为吞吐，走 accelerate 原生
+910B1 是 64GB，默认的 fp32 完全吃得下。集群多卡只为吞吐，走 accelerate 原生
 DDP，**不需要 FSDP / ZeRO / MindSpeed**。
 
 > MindSpeed 的价值在模型并行。原本 MiMo-Audio 7B 那条线要 128GB、单卡放不下，
@@ -230,7 +243,9 @@ Auto 就是静默失配。
 
 ### 8.1 `torchaudio==2.1.0` 的 aarch64 wheel 是否装得上 —— 阻塞级
 
-§2 第三条依赖里最不确定的一个。装不上就 `import qwen_tts` 直接失败，整条链路起不来。
+**✅ 已解决（2026-08-15 实测）**：本机环境里已有 torchaudio 2.1.0（aarch64，
+`/home/ma-user/anaconda3/envs/PyTorch-2.1.0/lib/python3.9/site-packages/torchaudio`），
+import 正常。兜底方案保留备查但没用到。
 
 **兜底方案**（不用装 torchaudio）：把 `qwen_tts/core/__init__.py` 里 25Hz tokenizer
 的 import 改成惰性加载。本链路走 12Hz，`tokenizer_25hz/` 全程用不到，
@@ -238,13 +253,20 @@ Auto 就是静默失配。
 
 ### 8.2 `transformers 4.57.3` 在 torch 2.1.0 上能否正常运行 —— 阻塞级
 
-4.56+ 的 setup 声明 `torch>=2.2`。好消息是 torch 不在它的 `install_requires` 里，
-所以装它**不会**顶掉 torch 2.1.0；坏消息是运行期是否用到 2.2+ 的 API
-（`torch.nn.attention` 系列、新的 pytree 注册等）离线核实不了。
+**✅ 已解决（2026-08-15 实测）**：**4.57.3 确实崩**，而且比预想更狠——
+`torch_npu` 的 import 链经 `torch.onnx._internal.fx.patcher` 会 import transformers，
+所以 transformers 一崩连 `import torch_npu` 都失败。根因正是 pytree 注册：
+4.56+ 无条件调 `torch.utils._pytree.register_pytree_node`（torch 2.2+ 才有），
+4.57.3 在 torch 2.1.0 上报
+`AttributeError: module 'torch.utils._pytree' has no attribute 'register_pytree_node'`。
 
-**上机第一步就单独验**：`python -c "import transformers, qwen_tts"`。
-真不兼容的话退到 transformers 4.5x 中支持 py3.9 + torch 2.1 的版本，
-但**必须 ≥ 4.41**（见 §1）。
+实测结论：**钉 `transformers==4.55.2`**（4.5x 中最后一个带 `torch>=2.2` 版本守卫
+的版本，已逐版本核对源码；连带 tokenizers 0.21.4）。同时给 qwen_tts 加了两处
+版本兼容（开发机 4.57.3 不受影响）：
+- `@check_model_inputs()`：4.55.2 里还是裸装饰器（缺 func 报 TypeError），
+  4.57+ 才是工厂形式 → `modeling_qwen3_tts_tokenizer_v2.py` 加了两种形式都认的垫片
+- `from_pretrained(dtype=...)`：4.55.2 不认这个新参数 → 冒烟脚本改回老牌的
+  `torch_dtype=...`（新旧通吃）
 
 ### 8.3 CANN 的 `set_env.sh` 与 `set -u` —— 中等
 
@@ -310,10 +332,10 @@ python -c "import qwen_tts; print('qwen_tts OK')"
 
 | 项 | 预期 | 实测 |
 |---|---|---|
-| torch / torch_npu | 2.1.0 / 2.1.0.post8 | |
-| transformers | ≥ 4.41（目标 4.57.3） | |
-| `import qwen_tts` | 无报错 | |
-| `torchaudio==2.1.0` 装上了吗 | 是 | |
+| torch / torch_npu | 2.1.0 / 2.1.0.post8 | ✅ 2.1.0 / 2.1.0.post8.dev20241029 |
+| transformers | ≥ 4.41（目标 4.57.3） | ✅ 4.55.2（4.57.3 实测崩，见 §8.2） |
+| `import qwen_tts` | 无报错 | ✅ OK（python 3.9.10） |
+| `torchaudio==2.1.0` 装上了吗 | 是 | ✅ 环境里已有 2.1.0 |
 
 装不上 torchaudio 就走 §8.1 的兜底（25Hz tokenizer 改惰性 import）。
 
@@ -326,12 +348,16 @@ python npu_smoke_test.py --model_path <VoiceDesign 目录>
 
 | 阶段 | 要回填的数 | 实测 |
 |---|---|---|
-| 1 | bf16 matmul 耗时、显存总量 | |
-| 2 | sdpa 耗时 / eager 耗时 | |
-| 4 | audio_codes shape | |
-| 5 | 7 项是否全 PASS | |
-| 6 | loss 首值 → 末值 | |
-| 8 | 两条 instruct 的时长差 % | |
+| 1 | bf16 matmul 耗时、显存总量 | ✅ 0.252s / 60.5 GiB 可用（总 61.0 GiB） |
+| 2 | sdpa 耗时 / eager 耗时 | ✅ 0.001s / 0.004s（sdpa 快约 4×） |
+| 4 | audio_codes shape | ✅ (32, 16) |
+| 5 | 7 项是否全 PASS | ✅ 7/7 PASS |
+| 6 | loss 首值 → 末值 | ✅ 3.7002 → 3.6943（6 步，步数少基本持平属正常） |
+| 8 | 两条 instruct 的时长差 % | ✅ 10.5%（对机 2.72s / 对人 3.04s） |
+
+**结论：阶段 0-8 全部通过 ✅（2026-08-15，910B1 单卡），训练链路在 NPU 上跑通。**
+模型路径：`/home/ma-user/work/dataset/wsj-mimo-data/Qwen3-TTS-ckpt`。
+完整日志见随本文档一起提交的 `finetuning/scripts/npu_smoke_report.txt`。
 
 ### 9.3 多卡梯度同步（对应 §8.6）—— *训练跑通之后再做*
 
@@ -401,6 +427,42 @@ python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
 | 43.5w 条 1 epoch 预估耗时 | 单步耗时 × 步数 | |
 
 
+## 10. 上机实测记录（2026-08-15，910B1 单卡）
+
+§9.1/§9.2 之外，这次上机还踩出/确认了以下几条，均已在代码或文档中处理：
+
+1. **模型下载走 curl，不走 huggingface-cli**：本机代理
+   （proxy-notebook.modelarts.com:8083）对 Python requests 的 CONNECT 隧道返回
+   503 Tunnel failed，但 curl 正常。且 VoiceDesign 仓库里
+   `speech_tokenizer/speech_tokenizer/` 是内嵌子仓库，resolve 只返回
+   「Entry not found」空指针——tokenizer 权重要从独立仓库
+   `Qwen/Qwen3-TTS-Tokenizer-12Hz` 下载，摆平到 `<模型>/speech_tokenizer/` 下。
+   本机模型已就位：`/home/ma-user/work/dataset/wsj-mimo-data/Qwen3-TTS-ckpt`
+   （主模型 404 张量 / 1.917B / BF16；tokenizer 496 张量 / 170.6M / F32，
+   均用 safetensors 头校验过）。
+
+2. **`device_map` 的 meta 快速加载路径在 torch 2.1 + torch_npu 上不可用**：
+   `from_pretrained(..., device_map="npu:0")` 走 low_cpu_mem_usage 的 meta 加载，
+   `param[...]` 触发 `torch.cuda._lazy_init` →
+   `AssertionError: Torch not compiled with CUDA enabled`（与 transformers 版本无关，
+   是 torch 2.1 + torch_npu 的组合问题）。修法：**统一 CPU 加载后 `.to("npu:0")`**，
+   已改冒烟 s3/s4/s8 与 `prepare_data.py`；训练脚本本来就不走 device_map，不受影响。
+   集群和调试机同栈，不会复发。
+
+3. **芯片型号是 910B1**：npu-smi 与 `torch.npu.get_device_name(0)` 都是
+   `Ascend910B1`，NPU_ENV.md 与本文档原写 910B2，已全部更正。64GB 显存一致。
+
+4. **pip 必须 `--user`**：base 镜像 conda 环境里有 root 所有的文件（tokenizers
+   的 dist-info），普通 pip 卸载时报 `Permission denied: 'METADATA'`。user site
+   优先级更高正好覆盖（§2 已写明）。
+
+5. **阶段 8 推理极慢，训练 step 正常**：两条 instruct 各花了约 20 分钟，期间
+   CPU 92% / AICore 0%（CPU-bound，疑似逐 token 小算子 launch 开销）。
+   这不影响训练吞吐（阶段 6 的 6 步含编译总共几分钟），但 9.6 的规模估算要
+   把训练 step 耗时和推理时延分开算；推理侧的耗时留待 9.4/9.5 一起复测。
+   （另：sox CLI 缺失的告警无害——python sox 包可用，12Hz 链路不依赖 CLI。）
+
+
 ## 附：已知会失败的地方（已在代码里处理，列出来备查）
 
 | 项 | 处理 |
@@ -410,6 +472,8 @@ python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
 | `modeling_qwen3_tts.py` 有 PEP 604 注解，py3.9 import 即崩 | 已加 `from __future__ import annotations` |
 | 集群上自设 `ASCEND_RT_VISIBLE_DEVICES` 会和调度打架 | 集群脚本不设，交给 ModelArts |
 | ckpt 保存后残留 `index.json` 会让新权重失效 | 保存前已删 |
+| `device_map` 走 meta 加载路径，torch 2.1 + torch_npu 上必崩 | 统一 CPU 加载 + `.to("npu:0")`（见 §10.2） |
+| 装包写不进 conda 环境（root 所有的 dist-info） | `pip install --user`（见 §2/§10.4） |
 
 ---
 
@@ -460,3 +524,44 @@ python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
   （`sft_12hz_voicedesign.py:199-201`）；集群脚本不设 ASCEND_RT_VISIBLE_DEVICES
 - NPU_ENV.md §2（transformers 缺失、accelerate 1.0.0、py3.9）与 §6.1（CANN 配方）
   与本指南叙述一致
+
+### 二轮复核（pull 到 e3d9f8f 后，2026-08-15）
+
+`bb5926d`（--dtype fp32 默认）、`14c3e42`（V2TrainStep 封装 + review 其余）、
+`e3d9f8f`（§8 未确认点）三个提交逐条验过，方向都对：V2TrainStep 让 autocast
+与 DDP allreduce 同时生效（两者都挂在被 prepare 模块的 forward 上）；bf16 落盘
+补丁括号/键名处理正确；模块级 torch_npu import 解决跳过阶段 0 的误报；阶段 5
+前缀逐格断言的算术与 collate 吻合；§2 补的 sox/onnxruntime/einops/torchaudio
+==2.1.0 与 import 链一致。又修了两处残留：
+
+1. 27GiB 未改干净：run_v2_npu_debug.sh / run_v2_npu_cluster.sh 头注、smoke 阶段 1
+   告警仍写 27GiB（与 14c3e42 自己的「统一 25GiB」矛盾），已统一为 25GiB。
+2. §4 示例 `RAW_JSONL=./data_v2/train_raw.jsonl` 与脚本的 realpath -m 不匹配：
+   相对路径按脚本启动目录解析，会指向 scripts/data_v2/ 而非 prepare_v2_data 的
+   落盘位置。示例已改为用默认路径并注明覆盖需传绝对路径。
+
+### 三轮对齐（对照参考仓库 duplex_huanyu_qwen35 脚本对，2026-08-15）
+
+真跑是「提交一个脚本到集群」，对照 `pretrain_al_cls.sh`（及其 fb128 新版本）：
+- 集群变量（VC_WORKER_HOSTS / MA_NUM_HOSTS / VC_TASK_INDEX）与路径布局
+  （/opt/huawei/quoteModel、/opt/huawei/dataset）本就一致
+- 已补齐：`HCCL_IF_BASE_PORT=64111`、`MASTER_PORT=6411` + netstat 端口检查、
+  `npu-smi info`、脚本内 pip install（SKIP_INSTALL=1 可跳）、CANN source 后显式
+  补 LD_LIBRARY_PATH/PATH
+- 刻意保留差异：启动器用 torchrun 不用 msrun（不依赖 megatron/mindspore）；
+  nnal/atb/set_env.sh 不 source（MindSpeed 专用算子库，HF 路线用不到）
+
+### 四轮：上机实测 + 收尾修正（2026-08-15）
+
+在 910B1 上完成了 §9.1/§9.2 全流程（0-8 全过，详见 §9 回填与 §10），过程中修掉
+5 个只有上机才会暴露的问题，均已改代码并写回本文档：
+
+1. transformers 4.57.3 在 torch 2.1.0 上 import 即崩（pytree API）→ 钉 4.55.2
+   （§8.2 回填）；qwen_tts 的 `@check_model_inputs()` 与
+   `from_pretrained(dtype=)` 两处加版本兼容（新旧 transformers 都通）
+2. pip 写不进 conda 环境（root 所有的 dist-info）→ 安装统一 `--user`，
+   两个启动脚本安装块同步更新
+3. `device_map` meta 加载路径在 torch 2.1 + torch_npu 上必崩 →
+   冒烟 s3/s4/s8 与 prepare_data.py 改为 CPU 加载 + `.to("npu:0")`
+4. 芯片型号 910B2 → **910B1**（npu-smi 与 torch 实测），NPU_ENV.md 同步更正
+5. 阶段 8 推理 CPU-bound 极慢（每条 ~20 分钟，AICore 0%），记入 §10.5 待 9.4/9.5 复测

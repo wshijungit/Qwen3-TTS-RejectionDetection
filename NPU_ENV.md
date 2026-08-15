@@ -7,7 +7,7 @@
 
 | 项目 | 值 |
 |---|---|
-| 芯片 | 1× Ascend 910B2（`npu-smi` 显示 NPU 1，Bus-Id 0000:01:00.0） |
+| 芯片 | 1× Ascend 910B1（`npu-smi` 显示 NPU 1，Bus-Id 0000:01:00.0） |
 | HBM | 64 GB（当前占用 ~3.4 GB，空闲，无运行进程） |
 | npu-smi 版本 | 25.5.1 |
 | 健康状态 | OK |
@@ -20,7 +20,7 @@
 - **Python**: conda env `PyTorch-2.1.0`（`/home/ma-user/anaconda3/envs/PyTorch-2.1.0`，Python 3.9.10，当前默认激活）
 - **框架**:
   - torch 2.1.0
-  - torch_npu 2.1.0.post8.dev20241029（✅ 实测 bf16 matmul 正常，`torch_npu.npu.device_count()==1`，device name `Ascend910B2`）
+  - torch_npu 2.1.0.post8.dev20241029（✅ 实测 bf16 matmul 正常，`torch_npu.npu.device_count()==1`，device name `Ascend910B1`）
   - accelerate 1.0.0
   - safetensors 0.4.5、librosa 0.10.2.post1
 - **缺失**（适配前需要安装）:
@@ -43,8 +43,8 @@
 适配要点：
 
 1. **device**: 全部 `cuda` → `npu`（`import torch_npu`；accelerate 可传 `device_placement`/直接用 `"npu"`，或用 torch_npu 的 `transfer_to_npu`/msadaptor）
-2. **flash_attention_2 不可用**：910B2 + HF 原生 transformers 下 `attn_implementation="flash_attention_2"` 会失败；改为 `eager`/SDPA，或装华为 patched transformers（参考仓库自带一份 `transformers/` 目录）
-3. **bf16**: 910B2 原生支持，实测 OK
+2. **flash_attention_2 不可用**：910B1 + HF 原生 transformers 下 `attn_implementation="flash_attention_2"` 会失败；改为 `eager`/SDPA，或装华为 patched transformers（参考仓库自带一份 `transformers/` 目录）
+3. **bf16**: 910B1 原生支持，实测 OK
 4. **1.7B/0.6B 模型 bf16 微调**，64GB HBM 单卡足够
 
 ## 4. 参考仓库：Qwen35_huanyu_9B_whj（MindSpeed-MM-XY）
@@ -65,14 +65,14 @@
 ## 5. 验证命令（已验证通过）
 
 ```bash
-npu-smi info                                   # 1×910B2, OK, 64GB
-python3 -c "import torch, torch_npu; print(torch_npu.npu.device_count(), torch_npu.npu.get_device_name(0))"  # 1 Ascend910B2
+npu-smi info                                   # 1×910B1, OK, 64GB
+python3 -c "import torch, torch_npu; print(torch_npu.npu.device_count(), torch_npu.npu.get_device_name(0))"  # 1 Ascend910B1
 # bf16 matmul 2048×2048 ×20 次 ≈ 0.12s，正常
 ```
 
 ## 6. 运行形态：本机 debug，集群提交跑
 
-- **本机（本仓库所在机器）**：单卡 910B2，用于 debug，环境问题尽量通过启动脚本解决
+- **本机（本仓库所在机器）**：单卡 910B1，用于 debug，环境问题尽量通过启动脚本解决
 - **最终运行**：ModelArts 集群提交（8 卡/节点、多机），环境由集群注入（`VC_WORKER_HOSTS`/`MA_NUM_HOSTS`/`VC_TASK_INDEX`/`CANN_DIR`）
 - 参考仓库已给出「debug 版 + 集群版」脚本对：
   - debug 版：`examples/mm_model/duplex_huanyu_qwen35/pretrain_debug_cls.sh`（本机路径硬编码、单机 127.0.0.1、`--is-debug`）

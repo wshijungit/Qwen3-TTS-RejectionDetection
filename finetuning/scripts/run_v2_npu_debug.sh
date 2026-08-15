@@ -1,7 +1,7 @@
 #!/bin/bash
 # V2 VoiceDesign 微调 —— 本机 debug 版（单卡 910B2 / 64GB）。
 #
-# 1.7B 全参微调静态显存：--dtype fp32（默认）约 27GiB，--dtype bf16 约 12.7GiB
+# 1.7B 全参微调静态显存：--dtype fp32（默认）约 25GiB，--dtype bf16 约 12.7GiB
 # （实测 accelerate 的 bf16 下参数/梯度/Adam 动量全是 bf16）。64GB 单卡装得下 ——
 # **不需要任何分布式**，直接 python 起，
 # 不用 torchrun、不用 FSDP、不用 MindSpeed。
@@ -16,6 +16,18 @@ set -euo pipefail   # npu_env.sh 不再设，由各启动脚本自己负责
 . "$HERE/npu_env.sh"
 
 PY=${PY:-python3}
+
+# ---------- 依赖安装（与集群版一致；SKIP_INSTALL=1 可跳过）----------
+# 必须 --user：base 镜像的 conda 环境里有 root 所有的文件（如 tokenizers 的
+# dist-info），普通 pip 卸载/覆盖会 Permission denied。user site 优先级更高，正好覆盖。
+# transformers 钉 4.55.2 不是 4.57.3：4.56+ 无条件用 torch>=2.2 的
+# torch.utils._pytree.register_pytree_node，在 torch 2.1.0 上 import 即崩（实测）。
+if [ "${SKIP_INSTALL:-0}" != "1" ]; then
+    pip install --user transformers==4.55.2 "accelerate==1.0.0" "safetensors>=0.4.5" \
+        sox onnxruntime einops librosa soundfile "torchaudio==2.1.0" 2>&1 | tail -3
+    pip install --user -e "$FT_DIR" --no-deps 2>&1 | tail -3
+fi
+
 DEVICE=${DEVICE:-npu:0}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0}
 
