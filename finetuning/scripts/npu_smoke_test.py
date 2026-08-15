@@ -508,7 +508,7 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps,
     head, tail = sum(losses[:k]) / k, sum(losses[-k:]) / k
     ok(f"loss 前 {k} 步均值 {head:.4f} → 后 {k} 步均值 {tail:.4f}（共 {len(losses)} 步；"
        f"首末单点 {losses[0]:.4f}/{losses[-1]:.4f} 仅供参考，单样本噪声大）")
-    ok(f"batch={batch} → {steps / max(dt, 1e-9) * batch:.1f} 样本/秒")
+    ok(f"batch={batch} → {steps / max(wall, 1e-9) * batch:.1f} 样本/秒")
     ok(f"训练总耗时 {wall:.1f}s（含加载/编译），约 {wall / len(losses):.1f}s/step")
     if tail >= head:
         warn("loss 均值没下降。注意 batch=1 且样本数 < 步数时，一个 epoch 内每条只见"
@@ -657,6 +657,16 @@ def main():
             if not s3_load(args.model_path, args.attn):
                 failed.append(3)
                 raise SystemExit
+        # 4b：生产数据准备链路回归（prepare_v2_data.py → prepare_data.py）。
+        # 与阶段 4 一起默认跑；--skip-pipeline 跳过，--use-pipeline-codes 让后续
+        # 阶段改用 4b 产出的 codes（而非阶段 4 的合成数据）
+        if 4 in want and not args.skip_pipeline and not args.codes_jsonl:
+            pipe_codes = s4b_pipeline(args.model_path, wd, args.device)
+            if not pipe_codes:
+                failed.append("4b")
+                raise SystemExit
+            if args.use_pipeline_codes:
+                state["codes"] = pipe_codes
         if 4 in want:
             ran.add(4)   # 给了 --codes_jsonl 也视为已满足（用户自带产物）
             if not args.codes_jsonl:

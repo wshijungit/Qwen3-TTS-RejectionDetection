@@ -1,0 +1,116 @@
+工作目录 /tmp/npu_smoke_a5293pbf
+模型 /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+阶段 [0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+==================================================================
+[阶段 0] 环境
+==================================================================
+  torch 2.1.0 / torch_npu 2.1.0.post8.dev20241029
+  ✅ 1 张卡，device0 = Ascend910B1
+  ✅ transformers 4.55.2
+  ✅ accelerate 1.0.0
+  ✅ Accelerator 具备本链路用到的全部接口
+  ✅ qwen_tts 可 import（python 3.9.10）
+
+==================================================================
+[阶段 1] 基础算子
+==================================================================
+  ✅ bf16 matmul 2048² ×20 耗时 0.235s
+  ✅ 显存 60.5 / 61.0 GiB 可用
+
+==================================================================
+[阶段 2] 注意力后端（本链路在 NPU 上最大的性能未知项）
+==================================================================
+  ✅ sdpa   可用，10 次耗时 0.001s
+  ✅ eager  可用，10 次耗时 0.002s
+  ✅ sdpa 有加速效果，按默认用 sdpa
+
+==================================================================
+[阶段 3] 模型加载
+==================================================================
+  ✅ 加载成功 7.6s，参数 1.92B，attn=sdpa
+  ✅ tts_model_type = voice_design
+
+==================================================================
+[阶段 4b] 真实数据准备链路（prepare_v2_data.py → prepare_data.py）
+==================================================================
+  |   保留                   11   (accept 5 / reject 6)
+  |     - label_mismatch               1   (gemini判reject实为accept 0 / gemini判accept实为reject 1)
+  |   保留比例分位      p1 0.62 | p5 0.62 | p25 0.62 | p50 0.62
+  ✅ prepare_v2_data.py 通过，产出 10 条 ['audio', 'instruct', 'text']
+  ✅ prepare_data.py 通过，抽码 10 条
+  ✅ 断点续跑正确（截断到 5 → 补齐 10）
+
+==================================================================
+[阶段 4] 音频 tokenizer（抽 audio_codes）
+==================================================================
+  ✅ 造了 8 条合成样本
+  ✅ 抽码成功，8 条，shape=(32, 16)（应为 (T, 16)）
+
+==================================================================
+[阶段 5] 序列布局（与推理侧逐格核对，纯 CPU）
+==================================================================
+  ✅ codec_bos 与 tts_eos 分处两格: PASS
+  ✅ tts_eos 那格 codec = codec_pad: PASS
+  ✅ codec_bos 那格 text = tts_pad: PASS
+  ✅ label 起点 = codec_bos 位: PASS
+  ✅ label 末位 = codec_eos: PASS
+  ✅ 对齐块 codec 前缀逐格相符（block 宽 5，think 开头）: PASS
+  ✅ instruct 段 codec_embedding_mask 为 False: PASS
+
+==================================================================
+[阶段 6] 前反向（6 步，batch=1，bucket=64）
+==================================================================
+  $ cd /home/ma-user/work/dataset/wsj-mimo-data/Qwen3-TTS-RejectionDetection/finetuning && /home/ma-user/anaconda3/envs/PyTorch-2.1.0/bin/python sft_12hz_voicedesign.py --init_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign --train_jsonl /tmp/npu_smoke_a5293pbf/train_codes.jsonl --output_model_path /tmp/npu_smoke_a5293pbf/ckpt --batch_size 1 --grad_accum 1 --num_epochs 1 --max_steps 6 --log_every 1 --attn sdpa --language Chinese --dtype fp32 --length-bucket 64 --save-every 0 2>&1
+
+  | /bin/sh: sox: command not found
+  | SoX could not be found!
+  | 
+  |     If you do not have SoX, proceed here:
+  |      - - - http://sox.sourceforge.net/ - - -
+  | 
+  |     If you do (or think that you should) have SoX, double-check your
+  |     path variables.
+  |     
+  | Detected kernel version 4.19.90, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+  | 
+  | ********
+  | Warning: flash-attn is not installed. Will only run the manual PyTorch version. Please install flash-attn for faster inference.
+  | ********
+  |  
+  | Epoch 0 | Step 0 | Loss: 3.2591
+  | Epoch 0 | Step 1 | Loss: 3.2061
+  | Epoch 0 | Step 2 | Loss: 4.3455
+  | Epoch 0 | Step 3 | Loss: 4.3505
+  | Epoch 0 | Step 4 | Loss: 5.3223
+  | Epoch 0 | Step 5 | Loss: 4.3793
+  | 到达 --max_steps 6，提前结束
+  | 已保存 /tmp/npu_smoke_a5293pbf/ckpt/checkpoint-epoch-0
+  ✅ loss 前 3 步均值 3.6036 → 后 3 步均值 4.6840（共 6 步；首末单点 3.2591/4.3793 仅供参考，单样本噪声大）
+  ✅ batch=1 → 0.1 样本/秒
+  ✅ 训练总耗时 114.2s（含加载/编译），约 19.0s/step
+  ⚠️  loss 均值没下降。注意 batch=1 且样本数 < 步数时，一个 epoch 内每条只见一次，本就不该有可见收敛——要看收敛请固定小样本集跑多个 epoch。若几百步仍不降且用的是 --dtype bf16，换 --dtype fp32 再试（bf16 下 Adam 动量也是 bf16，更新易下溢）
+
+==================================================================
+[阶段 7] checkpoint 完整性
+==================================================================
+  ✅ config.json + model.safetensors 都在
+  ✅ 无残留 index.json
+  ✅ tts_model_type = voice_design, v2_train_language = Chinese
+
+==================================================================
+[阶段 8] 推理（验证 instruct 通路仍生效）
+==================================================================
+  language=Chinese（必须与训练一致，否则 codec 前缀块宽不同 = 静默失配）
+  ✅ speech_tokenizer 已在 npu:0（decode 不会退回 CPU）
+  ✅ 微调后的 ckpt 可加载
+  ✅ 对机腔 生成成功 1.68s → /tmp/npu_smoke_a5293pbf/infer_对机.wav
+  ✅ 对人腔 生成成功 6.88s → /tmp/npu_smoke_a5293pbf/infer_对人.wav
+
+  同一句文本、两条 instruct 的时长差 = 75.6%
+  ✅ 时长有明显差异，instruct 通路在起作用（腔调对不对仍需听辨）
+
+==================================================================
+失败阶段: 无 —— 全部通过 ✅
+产物在 /tmp/npu_smoke_a5293pbf
+==================================================================
