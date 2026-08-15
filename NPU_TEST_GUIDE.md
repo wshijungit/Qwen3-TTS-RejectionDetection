@@ -439,13 +439,12 @@ done
 
 | ATTN | 20 步耗时 | 峰值显存（npu-smi） | 实测 |
 |---|---|---|---|
-| sdpa | | | 近似版（合成数据 20 步）119.8s |
-| eager | | | 近似版（合成数据 20 步）119.1s |
+| sdpa | | | 近似版（合成 20 步）119.8s；**正式版（真实 200 步）241.4s ≈ 1.2s/step** |
+| eager | | | 近似版（合成 20 步）119.1s；**正式版（真实 200 步）248.5s ≈ 1.2s/step** |
 
-**近似版已跑（2026-08-16，合成数据）**：20 步粒度 sdpa/eager 无差异（119.8s vs
-119.1s，均含加载与编译预热）。但 20 步太短、编译占比大，分辨不出真实差异；
-9.5 的 200 步 sdpa 稳态是 1.0s/step，等真实数据就绪后按上面命令补正式版对比
-（正式版务必加 `SKIP_PREPARE=1 TRAIN_JSONL=<绝对路径>`，避免每次重抽码）。
+**正式版已跑（2026-08-16，真实数据 256 条 × 200 步）**：sdpa 241.4s vs eager
+248.5s，差异 ~3%，**4D mask 训练路径下 sdpa 没有显著加速、也没有负收益**——
+§8.4 的疑问关闭，按默认 sdpa 继续即可（急着要基准时 eager 也可用，二者等价）。
 
 ### 9.5 收敛趋势（对应 §8.5）—— *之后*
 
@@ -538,6 +537,17 @@ loss 从 3.6 降到 1.1，**确认在真降不是抖**——bf16 之外的收敛
      全量 trimmed wav 约 50-60GB）。输出按上表路径约定：
      `--out-dir /home/ma-user/work/dataset/duplex_whj_data/v2`
      （train_raw/valid_raw 直接落在启动脚本的默认数据目录）。
+     §11.1 sanity check 已通过（见 §11 回填）。
+
+7. **numba JIT × libsndfile 加载 = 必崩（aarch64，2026-08-16 实测）**：
+   `import soundfile` 之后首次触发 librosa 的 numba JIT（`effects.trim` →
+   `util.frame`），llvmlite 的 RuntimeDyldELF 报 relocation overflow
+   （`Assertion 'isInt<33>(Result)' failed`，进程 SIGABRT）。根因是 libsndfile
+   的 .so 加载改变进程地址空间布局，LLVM JIT 代码段与全局符号距离超 4GB——
+   与 fork/spawn、数据长短、主/子进程都无关（三种组合都实测复现）。
+   修复：`prepare_v2_data.py` 的 energy VAD 换成**纯 numpy 实现**
+   （frame 2048 / hop 512，语义与 librosa.effects.trim 一致）；worker 池改
+   spawn 防 fork 继承的其它问题（全量约多花 12 分钟，可接受）。
 
 
 ## 11. 接真实数据（下一步）
@@ -576,11 +586,25 @@ python prepare_v2_data.py \
 再抽几条 `train_raw.jsonl` 看 instruct 转写通不通顺——**这是第一次在真实
 gemini 数据上跑转写**，之前都是合成样本。
 
+**11.1 实测（2026-08-16）**：三集各 100 条全过（音频处理 100/100，`wav_not_found`=0）。
+reject 占比筛选前后 19.8→12.0% / 33.9→29.0% / 48.6→47.0%（car05 降得少，limit 100
+样本小，全量再看）；VAD 切掉 48-63%（如 6.09s→2.24s），偏多——样本太小不下结论，
+全量统计时重点看这条，切太多就把 `--top-db` 上调。instruct 转写抽检 6 条通顺
+（能纠正 ASR 错字、结论词已剥净、无「应予拒识」尾巴）。train 290 / validate 10，
+accept 70.7% / reject 29.3%，无偏斜告警。
+
+**踩坑记录（§10.7）**：首跑 100/100 全崩——`import soundfile`（加载 libsndfile）
+之后再触发 librosa 的 numba JIT，本机 aarch64 上 llvmlite 必报 relocation
+overflow（SIGABRT）。已把 energy VAD 换成纯 numpy 实现，worker 池改 spawn。
+
 ### 11.2 小批量真实数据训一次
 
 ```bash
 MDL=/home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 head -256 data_v2_smoke/train_raw.jsonl > /tmp/real256.jsonl
+. scripts/npu_env.sh        # 必须 source：不 source 时系统 CANN 8.1 下 TBE 编译子进程崩
+                            # （"TBE Subprocess raise error, main process disappeared"，
+                            # 实测 batch 大小无关，8/32 都复现；8.5.0 环境无此问题）
 python prepare_data.py --device npu:0 \
   --tokenizer_model_path $MDL/speech_tokenizer \
   --input_jsonl /tmp/real256.jsonl --output_jsonl /tmp/real256_codes.jsonl
@@ -594,6 +618,13 @@ python npu_smoke_test.py --model_path $MDL \
 **序列会长不少**——阶段 5 的布局断言和显存都要重新确认。
 
 顺带这一步也是 **9.4 的正式版**：真实数据下再比一次 `--attn sdpa` / `eager`。
+
+**11.2 实测（2026-08-16）**：256 条真实数据全链路通过——抽码成功（source
+npu_env.sh 后 TBE 崩溃消失，见命令注释）、阶段 5 七项全 PASS（真实 instruct
+长序列下布局断言依然成立）、200 步 loss 3.3253 → 3.0212、**约 1.2s/step**
+（与合成数据 1.0s 接近，batch=1 的瓶颈不在序列长度）、阶段 8 时长差 34.6%
+（对机 1.36s / 对人 2.08s），instruct 通路生效。真实数据 smoke 报告见
+`npu_smoke_report_real256.txt`。
 
 ### 11.3 定规模后再全量
 
@@ -729,3 +760,15 @@ VAD 预计数小时，trimmed wav 约 50-60GB，`--skip-existing` 可断点续�
 4. 三份真实拒识打标数据与 MiMo 仓库 data_report.md 逐项核对：核心结论仍成立
    （行数/schema/wav 100% 在位），但新增了 CC 两个扁平 wav 池、~7 个新数据源、
    processed_train_08xx 多轮训练线——详情见 §10.6
+
+### 六轮：真实数据管线跑通（2026-08-16）
+
+1. §11.1 sanity check 通过：三集各 100 条，reject 占比筛选前后符合预期，
+   instruct 转写抽检通顺；VAD 切掉 48-63% 偏多，全量时重点看
+2. 修两个 worker 崩溃：numba JIT × libsndfile 加载（aarch64 必崩，energy VAD
+   改纯 numpy 实现，§10.7）；TBE 子进程崩溃（prepare_data.py 必须 source
+   npu_env.sh 的 CANN 8.5.0，系统 8.1 下必崩，§11.2 命令已注明）
+3. §11.2 通过：256 条真实数据抽码 + 阶段 5 七项全 PASS + 200 步
+   loss 3.33→3.02（1.2s/step）+ 阶段 8 时长差 34.6%
+4. §9.4 正式版结论：真实数据 200 步 sdpa 241.4s vs eager 248.5s 无差异，
+   §8.4 关闭，按默认 sdpa 继续

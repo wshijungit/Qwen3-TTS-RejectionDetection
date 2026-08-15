@@ -34,6 +34,7 @@ instruct 转写（只用 gemini 的 reason + evidence，不引入外部信息）
 
 import argparse
 import json
+import multiprocessing
 import os
 import random
 import re
@@ -43,6 +44,13 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import soundfile as sf
+
+# 必须 spawn：fork 的 worker 里首次触发 numba JIT（librosa.effects.trim）会在本机
+# aarch64 上崩 —— llvmlite 的 RuntimeDyldELF 报 relocation overflow
+# （`Assertion 'isInt<33>(Result)' failed`，进程 SIGABRT，整个池 BrokenProcessPool）。
+# 主进程 JIT 正常，spawn 后各 worker 是全新解释器，不受 fork 继承的内存布局影响。
+# 代价是每建一次池要重新 import（16 worker × ~2s），全量 22 个分块约多 12 分钟。
+_MP_CTX = multiprocessing.get_context("spawn")
 
 # ---------------------------------------------------------------- 常量
 
@@ -163,13 +171,32 @@ def trim_silence(wav, sr, mode, top_db, silero_path):
             return wav[:0], False
         return wav[ts[0]["start"] : ts[-1]["end"]], True
 
-    # energy（默认）：librosa 能量阈值，无额外依赖
-    import librosa
-
-    trimmed, _ = librosa.effects.trim(wav, top_db=top_db)
-    if trimmed.size == 0:
+    # energy（默认）：纯 numpy 实现，**不要换回 librosa**。
+    # 实测本机 aarch64 上「import soundfile（加载 libsndfile .so）+ numba JIT
+    # （librosa.effects.trim → util.frame）」组合必崩：llvmlite RuntimeDyldELF 报
+    # relocation overflow（`Assertion 'isInt<33>(Result)' failed`，SIGABRT）——
+    # libsndfile 的加载改变了进程地址空间布局，LLVM JIT 的代码段与全局符号距离
+    # 超过 4GB。主进程/worker、fork/spawn 都不行，与数据无关。
+    # 语义与 librosa.effects.trim 一致（frame 2048 / hop 512）：分帧 RMS → dB →
+    # 掐掉首尾低于 (max_db - top_db) 的帧。
+    FRAME, HOP = 2048, 512
+    if wav.size < FRAME:
         return wav[:0], False
-    return trimmed, True
+    n = 1 + (wav.size - FRAME) // HOP
+    frames = np.lib.stride_tricks.as_strided(
+        wav,
+        shape=(n, FRAME),
+        strides=(wav.strides[0] * HOP, wav.strides[0]),
+        writeable=False,
+    )
+    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+    ref_db = 20.0 * np.log10(max(float(rms.max()), 1e-10)) - top_db
+    idx = np.nonzero(20.0 * np.log10(np.maximum(rms, 1e-10)) > ref_db)[0]
+    if idx.size == 0:
+        return wav[:0], False
+    start = int(idx[0]) * HOP
+    end = min(wav.size, (int(idx[-1]) + 1) * HOP + FRAME)
+    return wav[start:end], True
 
 
 # ---------------------------------------------------------------- 单条处理（子进程）
@@ -629,7 +656,7 @@ def main():
             chunk = candidates[start : start + CHUNK]
             chunk_done = 0  # 块内独立计数，不能用全局 done 反推
             try:
-                with ProcessPoolExecutor(max_workers=args.workers) as ex:
+                with ProcessPoolExecutor(max_workers=args.workers, mp_context=_MP_CTX) as ex:
                     jobs = ({"rec": c, "cfg": cfg, "ds_name": ds_name} for c in chunk)
                     for r in ex.map(process_one, jobs, chunksize=64):
                         chunk_done += 1

@@ -1,0 +1,71 @@
+工作目录 /tmp/npu_smoke_mmvddubc
+模型 /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+阶段 [5, 6, 7, 8]
+
+==================================================================
+[阶段 5] 序列布局（与推理侧逐格核对，纯 CPU）
+==================================================================
+  ✅ codec_bos 与 tts_eos 分处两格: PASS
+  ✅ tts_eos 那格 codec = codec_pad: PASS
+  ✅ codec_bos 那格 text = tts_pad: PASS
+  ✅ label 起点 = codec_bos 位: PASS
+  ✅ label 末位 = codec_eos: PASS
+  ✅ 对齐块 codec 前缀逐格相符（block 宽 5，think 开头）: PASS
+  ✅ instruct 段 codec_embedding_mask 为 False: PASS
+
+==================================================================
+[阶段 6] 前反向（200 步，看 loss 是否真的在降）
+==================================================================
+  $ cd /home/ma-user/work/dataset/wsj-mimo-data/Qwen3-TTS-RejectionDetection/finetuning && /home/ma-user/anaconda3/envs/PyTorch-2.1.0/bin/python sft_12hz_voicedesign.py --init_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign --train_jsonl /tmp/real256_codes.jsonl --output_model_path /tmp/npu_smoke_mmvddubc/ckpt --batch_size 1 --grad_accum 1 --num_epochs 1 --max_steps 200 --log_every 1 --attn sdpa --language Chinese --dtype fp32 2>&1
+
+  | Epoch 0 | Step 177 | Loss: 4.0447
+  | Epoch 0 | Step 178 | Loss: 4.0932
+  | Epoch 0 | Step 179 | Loss: 4.5301
+  | Epoch 0 | Step 180 | Loss: 4.2101
+  | Epoch 0 | Step 181 | Loss: 4.0117
+  | Epoch 0 | Step 182 | Loss: 4.0259
+  | Epoch 0 | Step 183 | Loss: 4.4704
+  | Epoch 0 | Step 184 | Loss: 4.2816
+  | Epoch 0 | Step 185 | Loss: 3.5599
+  | Epoch 0 | Step 186 | Loss: 3.5175
+  | Epoch 0 | Step 187 | Loss: 2.0406
+  | Epoch 0 | Step 188 | Loss: 4.3433
+  | Epoch 0 | Step 189 | Loss: 3.6328
+  | Epoch 0 | Step 190 | Loss: 4.0537
+  | Epoch 0 | Step 191 | Loss: 3.7491
+  | Epoch 0 | Step 192 | Loss: 4.0084
+  | Epoch 0 | Step 193 | Loss: 4.2277
+  | Epoch 0 | Step 194 | Loss: 5.4059
+  | Epoch 0 | Step 195 | Loss: 4.5109
+  | Epoch 0 | Step 196 | Loss: 4.5376
+  | Epoch 0 | Step 197 | Loss: 3.9813
+  | Epoch 0 | Step 198 | Loss: 4.1782
+  | Epoch 0 | Step 199 | Loss: 3.0212
+  | 到达 --max_steps 200，提前结束
+  | 已保存 /tmp/npu_smoke_mmvddubc/ckpt/checkpoint-epoch-0
+  ✅ loss 3.3253 → 3.0212（200 步）
+  ✅ 训练总耗时 241.4s（含加载/编译），约 1.2s/step
+
+==================================================================
+[阶段 7] checkpoint 完整性
+==================================================================
+  ✅ config.json + model.safetensors 都在
+  ✅ 无残留 index.json
+  ✅ tts_model_type = voice_design, v2_train_language = Chinese
+
+==================================================================
+[阶段 8] 推理（验证 instruct 通路仍生效）
+==================================================================
+  language=Chinese（必须与训练一致，否则 codec 前缀块宽不同 = 静默失配）
+  ✅ speech_tokenizer 已在 npu:0（decode 不会退回 CPU）
+  ✅ 微调后的 ckpt 可加载
+  ✅ 对机腔 生成成功 1.36s → /tmp/npu_smoke_mmvddubc/infer_对机.wav
+  ✅ 对人腔 生成成功 2.08s → /tmp/npu_smoke_mmvddubc/infer_对人.wav
+
+  同一句文本、两条 instruct 的时长差 = 34.6%
+  ✅ 时长有明显差异，instruct 通路在起作用（腔调对不对仍需听辨）
+
+==================================================================
+失败阶段: 无 —— 全部通过 ✅
+产物在 /tmp/npu_smoke_mmvddubc
+==================================================================

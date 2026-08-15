@@ -1,0 +1,53 @@
+工作目录 /tmp/npu_smoke_fm9u95ga
+模型 /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+阶段 [5, 6]
+
+==================================================================
+[阶段 5] 序列布局（与推理侧逐格核对，纯 CPU）
+==================================================================
+  ✅ codec_bos 与 tts_eos 分处两格: PASS
+  ✅ tts_eos 那格 codec = codec_pad: PASS
+  ✅ codec_bos 那格 text = tts_pad: PASS
+  ✅ label 起点 = codec_bos 位: PASS
+  ✅ label 末位 = codec_eos: PASS
+  ✅ 对齐块 codec 前缀逐格相符（block 宽 5，think 开头）: PASS
+  ✅ instruct 段 codec_embedding_mask 为 False: PASS
+
+==================================================================
+[阶段 6] 前反向（200 步，看 loss 是否真的在降）
+==================================================================
+  $ cd /home/ma-user/work/dataset/wsj-mimo-data/Qwen3-TTS-RejectionDetection/finetuning && /home/ma-user/anaconda3/envs/PyTorch-2.1.0/bin/python sft_12hz_voicedesign.py --init_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign --train_jsonl /tmp/real256_codes.jsonl --output_model_path /tmp/npu_smoke_fm9u95ga/ckpt --batch_size 1 --grad_accum 1 --num_epochs 1 --max_steps 200 --log_every 1 --attn eager --language Chinese --dtype fp32 2>&1
+
+  | Epoch 0 | Step 177 | Loss: 4.0867
+  | Epoch 0 | Step 178 | Loss: 4.0673
+  | Epoch 0 | Step 179 | Loss: 4.4888
+  | Epoch 0 | Step 180 | Loss: 4.1651
+  | Epoch 0 | Step 181 | Loss: 5.7179
+  | Epoch 0 | Step 182 | Loss: 3.8109
+  | Epoch 0 | Step 183 | Loss: 3.4482
+  | Epoch 0 | Step 184 | Loss: 3.7839
+  | Epoch 0 | Step 185 | Loss: 3.7789
+  | Epoch 0 | Step 186 | Loss: 4.2392
+  | Epoch 0 | Step 187 | Loss: 4.4797
+  | Epoch 0 | Step 188 | Loss: 3.0737
+  | Epoch 0 | Step 189 | Loss: 3.5050
+  | Epoch 0 | Step 190 | Loss: 4.3171
+  | Epoch 0 | Step 191 | Loss: 5.5271
+  | Epoch 0 | Step 192 | Loss: 4.2196
+  | Epoch 0 | Step 193 | Loss: 4.1818
+  | Epoch 0 | Step 194 | Loss: 4.1227
+  | Epoch 0 | Step 195 | Loss: 3.7712
+  | Epoch 0 | Step 196 | Loss: 3.5388
+  | Epoch 0 | Step 197 | Loss: 2.8619
+  | Epoch 0 | Step 198 | Loss: 4.6465
+  | Epoch 0 | Step 199 | Loss: 3.7202
+  | 到达 --max_steps 200，提前结束
+  | 已保存 /tmp/npu_smoke_fm9u95ga/ckpt/checkpoint-epoch-0
+  ✅ loss 3.6132 → 3.7202（200 步）
+  ✅ 训练总耗时 248.5s（含加载/编译），约 1.2s/step
+  ⚠️  loss 没下降。步数太少时正常；若几百步仍不降且用的是 --dtype bf16，换 --dtype fp32 再试（bf16 下 Adam 动量也是 bf16，更新易下溢）
+
+==================================================================
+失败阶段: 无 —— 全部通过 ✅
+产物在 /tmp/npu_smoke_fm9u95ga
+==================================================================
