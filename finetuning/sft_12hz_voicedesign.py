@@ -138,6 +138,11 @@ def train():
                         help="CUDA 上可传 flash_attention_2；NPU 上不可用，保持 sdpa/eager")
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument(
+        "--save-every", type=int, default=0,
+        help="每 N 步存一次（0=只在 epoch 末存）。43.5w 条即使 batch=8 一个 epoch "
+             "也是小时级，中途崩就丢整个 epoch，全量训练务必设上",
+    )
+    parser.add_argument(
         "--length-bucket", type=int, default=64,
         help="序列长度向上取整到该倍数。昇腾按形状编译算子，长度每变一次就重编译一次；"
              "分桶后形状收敛到少数几档，编译可跨 step 复用。CUDA 上无此问题，设 1 即关闭",
@@ -193,6 +198,8 @@ def train():
             if step % args.log_every == 0:
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
             gstep += 1
+            if args.save_every > 0 and gstep % args.save_every == 0:
+                _save(accelerator, model, args, MODEL_PATH, f"step{gstep}")
             if args.max_steps > 0 and gstep >= args.max_steps:
                 accelerator.print(f"到达 --max_steps {args.max_steps}，提前结束")
                 stop = True
@@ -205,9 +212,11 @@ def train():
             break
 
 
-def _save(accelerator, model, args, MODEL_PATH, epoch):
+def _save(accelerator, model, args, MODEL_PATH, tag):
+    """tag 为 epoch 序号或 'stepN'。"""
     if accelerator.is_main_process:
-        out_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
+        name = f"checkpoint-epoch-{tag}" if isinstance(tag, int) else f"checkpoint-{tag}"
+        out_dir = os.path.join(args.output_model_path, name)
         shutil.copytree(MODEL_PATH, out_dir, dirs_exist_ok=True)
 
         # 保持 voice_design —— 官方脚本这里硬写 custom_voice，产出的 ckpt 会被

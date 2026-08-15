@@ -16,6 +16,7 @@
 
 import argparse
 import json
+import os
 
 from qwen_tts import Qwen3TTSTokenizer
 
@@ -40,38 +41,52 @@ def main():
         tokenizer_12hz.model.to(args.device)
         tokenizer_12hz.device = torch.device(args.device)
 
-    total_lines = open(args.input_jsonl).readlines()
-    total_lines = [json.loads(line.strip()) for line in total_lines]
+    # encoding 必须显式给：locale 为 C 的容器里读写中文会崩
+    with open(args.input_jsonl, encoding="utf-8") as f:
+        total_lines = [json.loads(l) for l in f if l.strip()]
 
-    final_lines = []
-    batch_lines = []
-    batch_audios = []
-    for line in total_lines:
+    # 断点续跑：43.5w 条抽码要跑数小时，原实现全攒内存、跑完才落盘，
+    # 中途崩一次全部重来。改为逐 batch 追加写出，重启时按已写行数跳过。
+    #
+    # 注意：续跑会改变 batch 的分组方式，而 batch encode **不具备 padding 不变性**
+    # ——同一条音频与不同长度的样本同 batch，个别处在 VQ 边界上的帧会翻到邻近码字
+    # （实测 0.8s 音频单独 encode vs 与 5s 同 batch，10 帧中 2 帧不同）。
+    # 对音质无影响（邻近码字），但**不要指望 codes 逐位可复现**。
+    done = 0
+    if os.path.exists(args.output_jsonl):
+        with open(args.output_jsonl, encoding="utf-8") as f:
+            done = sum(1 for l in f if l.strip())
+        if done:
+            print(f"续跑：已有 {done} 行，跳过", flush=True)
+    if done >= len(total_lines):
+        print("已全部完成"); return
+    total_lines = total_lines[done:]
 
-        batch_lines.append(line)
-        batch_audios.append(line['audio'])
+    def flush(fh, lines, audios):
+        enc = tokenizer_12hz.encode(audios)
+        for code, line in zip(enc.audio_codes, lines):
+            line["audio_codes"] = code.cpu().tolist()
+            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+        fh.flush()
+        lines.clear()
+        audios.clear()
 
-        if len(batch_lines) >= BATCH_INFER_NUM:
-            enc_res = tokenizer_12hz.encode(batch_audios)
-            for code, line in zip(enc_res.audio_codes, batch_lines):
-                line['audio_codes'] = code.cpu().tolist()
-                final_lines.append(line)
-            batch_lines.clear()
-            batch_audios.clear()
+    batch_lines, batch_audios = [], []
+    n = done
+    with open(args.output_jsonl, "a", encoding="utf-8") as fh:
+        for line in total_lines:
+            batch_lines.append(line)
+            batch_audios.append(line["audio"])
+            if len(batch_lines) >= BATCH_INFER_NUM:
+                flush(fh, batch_lines, batch_audios)
+                n += BATCH_INFER_NUM
+                if n % (BATCH_INFER_NUM * 50) == 0:
+                    print(f"  {n}/{done + len(total_lines)}", flush=True)
+        if batch_audios:
+            n += len(batch_audios)
+            flush(fh, batch_lines, batch_audios)
+    print(f"完成 {n} 行 → {args.output_jsonl}")
 
-    if len(batch_audios) > 0:
-        enc_res = tokenizer_12hz.encode(batch_audios)
-        for code, line in zip(enc_res.audio_codes, batch_lines):
-            line['audio_codes'] = code.cpu().tolist()
-            final_lines.append(line)
-        batch_lines.clear()
-        batch_audios.clear()
-
-    final_lines = [json.dumps(line, ensure_ascii=False) for line in final_lines]
-
-    with open(args.output_jsonl, 'w') as f:
-        for line in final_lines:
-            f.writelines(line + '\n')
 
 if __name__ == "__main__":
     main()

@@ -773,8 +773,17 @@ modeling 三处改动 / 冒烟与启动脚本做了两轮独立审查，12 个�
 ### 13.3 序列布局已 bitwise 确认
 
 review 用 monkeypatch 捕获推理 `generate` 的 prefill embedding，与训练侧
-`collate + V2TrainStep` 构造的逐位对比：**Chinese(nb=5) 与 Auto(nb=4) 两种模式
-max|diff| = 0**。此前只有逐格断言，现在是逐位。
+`collate + V2TrainStep` 构造的做逐位对比：**Chinese(nb=5) 与 Auto(nb=4) 两种模式
+下，有效区语义完全对齐（prefill 长度逐样本相等、padding 区 embedding 严格全零），
+数值差 ≤ 1e-6**。
+
+> ⚠️ 早先版本这里写的是「max|diff| = 0（bitwise 一致）」，**不对**。复跑实测是
+> 2.4e-7 ~ 9.5e-7，GPU 和 CPU 上都非零。根因是 GEMM 的形状舍入：同一个 pad token
+> 过 `text_projection`，序列长 1 与 128 的结果就差 2.4e-7（训练侧整条序列一次投影，
+> 推理侧分段投影，矩阵形状不同）。作为参照，bf16 的机器精度约 7.8e-3，比这个误差
+> 大 4 个数量级 —— **训练精度下毫无意义**。
+> 记在这里是为了让下一个复跑这项检查的人别把 1e-6 当回归误报。
+> 分桶不影响该结论：bucket=1 与 64 的 diff 逐样本完全相同。
 
 同时确认：404 个参数全部拿到非零梯度（无 DDP unused-parameter 隐患）、
 sub-talker 的 hidden 位置与推理 `past_hidden` 语义一致、
