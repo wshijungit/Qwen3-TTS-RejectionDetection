@@ -41,13 +41,29 @@ from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from torch.utils.data import Dataset
 
 
+# 序列长度向上取整到该值的倍数。
+#
+# 昇腾的算子是**按形状编译**的：形状每变一次就现场编译一次内核（CPU 编译、
+# NPU 等喂）。而 collate 原本按 batch 内最长样本 padding，每个 batch 长度都不同
+# —— 实测 12 条真实样本产生 12 种形状，等于每步都在重编译。这正是 NPU 上
+# 1.2s/step（batch=1）的主因，而 1.7B 在该规模下的真实计算量远小于此。
+#
+# 取整到 64 的倍数后，形状收敛到少数几档，编译结果可跨 step 复用。
+# 代价是多算一点 padding（平均多 32 格，相对 100 量级的序列约 30%），
+# 但省下的编译时间远大于此。CUDA 上无此问题（动态形状原生支持），
+# 设为 1 即退化回原行为。
+LENGTH_BUCKET = 64
+
+
 class VoiceDesignTTSDataset(Dataset):
-    def __init__(self, data_list, processor, config: Qwen3TTSConfig, language="Chinese", lag_num=-1):
+    def __init__(self, data_list, processor, config: Qwen3TTSConfig, language="Chinese",
+                 lag_num=-1, length_bucket=LENGTH_BUCKET):
         self.data_list = data_list
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
         self.language = language
+        self.length_bucket = max(1, int(length_bucket))
 
     def __len__(self):
         return len(self.data_list)
@@ -114,7 +130,10 @@ class VoiceDesignTTSDataset(Dataset):
             b["instruct_ids"].shape[1] + b["text_ids"].shape[1] + b["audio_codes"].shape[0]
             for b in batch
         ]
-        b_, t = len(batch), max(lens) + nb + 4   # end = lens+nb+3，留 1 格余量
+        need = max(lens) + nb + 4                # end = lens+nb+3，留 1 格余量
+        # 向上取整到分桶边界，让昇腾的编译结果能跨 step 复用（见 LENGTH_BUCKET）
+        bk = self.length_bucket
+        b_, t = len(batch), ((need + bk - 1) // bk) * bk
 
         input_ids = torch.zeros((b_, t, 2), dtype=torch.long)
         codec_ids = torch.zeros((b_, t, 16), dtype=torch.long)

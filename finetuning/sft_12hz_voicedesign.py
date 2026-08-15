@@ -138,6 +138,11 @@ def train():
                         help="CUDA 上可传 flash_attention_2；NPU 上不可用，保持 sdpa/eager")
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument(
+        "--length-bucket", type=int, default=64,
+        help="序列长度向上取整到该倍数。昇腾按形状编译算子，长度每变一次就重编译一次；"
+             "分桶后形状收敛到少数几档，编译可跨 step 复用。CUDA 上无此问题，设 1 即关闭",
+    )
+    parser.add_argument(
         "--dtype", choices=["bf16", "fp32"], default="fp32",
         help="权重精度。bf16 = 参数/梯度/Adam 动量全 bf16（AdamW 用 zeros_like 建 "
              "state，参数 bf16 则动量也是 bf16），1.7B 静态约 12.7GiB，但 exp_avg_sq "
@@ -159,7 +164,8 @@ def train():
     with open(args.train_jsonl) as f:
         train_data = [json.loads(l) for l in f if l.strip()]
     dataset = VoiceDesignTTSDataset(train_data, qwen3tts.processor, config,
-                                    language=args.language)
+                                    language=args.language,
+                                    length_bucket=args.length_bucket)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                                   collate_fn=dataset.collate_fn)
 

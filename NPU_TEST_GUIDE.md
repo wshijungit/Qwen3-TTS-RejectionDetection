@@ -647,6 +647,129 @@ python prepare_v2_data.py --dataset ... \
 VAD 预计数小时，trimmed wav 约 50-60GB，`--skip-existing` 可断点续跑。
 
 
+## 12. 提速：1.2s/step 的主因是**动态形状反复编译**（已加分桶，待实测）
+
+NPU 实测 batch=1 时 1.2s/step。1.7B 模型在这个序列长度（约 100-300 token）下的
+真实计算量远小于此，说明绝大部分时间不在算。
+
+### 12.1 根因
+
+昇腾的算子**按形状编译**（aclnn）。而 `collate_fn` 原本按 batch 内最长样本
+padding，**每个 batch 的序列长度都不同** —— 开发机实测：12 条真实样本产生
+**12 种不同形状**，等于每一步都在现场编译内核（CPU 编译、NPU 等喂）。
+
+这和推理慢是**同一个机理**。我此前判断"训练定长、不受影响"是错的。
+
+### 12.2 已做：长度分桶
+
+序列长度向上取整到 `--length-bucket`（默认 **64**）的倍数：
+
+```
+bucket=1  （原行为）: 12 种形状 [73, 77, 83, 84, 87, 95, 96, 98, 103, 107, 108, 110]
+bucket=64 （新默认）:  1 种形状 [128]
+```
+
+代价是多算一些 padding（平均多 32 格，相对 100 量级的序列约 30%），
+但省下的编译时间应远大于此。CUDA 上动态形状原生支持、无此问题，设 `1` 即关闭。
+
+**这条只在 NPU 上验证才有意义**，请在 §12.4 实测。
+
+### 12.3 其它可能的提速点（按预期收益排序，均未验证）
+
+| # | 手段 | 预期 | 备注 |
+|---|---|---|---|
+| 1 | **batch 调大** | 最直接 | 显存余量很大（fp32 用 25GiB / 61GiB）。step 时间不会线性增长，单样本吞吐显著改善 |
+| 2 | 长度分桶（§12.2） | 已做 | 与 batch 调大叠加：同 batch 内长度接近时 padding 浪费更少 |
+| 3 | 按长度分组采样 | 中 | 让同 batch 的样本长度接近，减少 padding。需改 sampler |
+| 4 | `--dtype bf16` | 低 | autocast 已让矩阵乘走 bf16，fp32 的代价主要在显存和优化器步，不在算力 |
+| 5 | `grad_accum` 调大 | 无 | 不减少 forward/backward 次数，只影响优化器步频率 |
+
+**先做 1 和 2，测出数再考虑 3。**
+
+### 12.4 请实测（跑完把数填进来）
+
+```bash
+cd finetuning/scripts && . ./npu_env.sh
+# 分桶开关对比
+for BK in 1 64; do
+  python npu_smoke_test.py --model_path <VoiceDesign> \
+    --codes_jsonl <real_codes.jsonl> --stages 6 --steps 50 \
+    2>&1 | tee /tmp/bk_$BK.log
+done
+```
+
+（`--length-bucket` 目前只在 `sft_12hz_voicedesign.py` 上，冒烟脚本用默认值；
+要对比就直接调训练脚本传 `--length-bucket 1` / `64`。）
+
+| 配置 | 50 步耗时 | s/step | 峰值显存 | 实测 |
+|---|---|---|---|---|
+| bucket=1, batch=1 | | | | |
+| bucket=64, batch=1 | | | | |
+| bucket=64, batch=4 | | | | |
+| bucket=64, batch=8 | | | | |
+
+由此定正式训练的 batch，并重算 43.5w 条 1 epoch 的耗时。
+
+
+## 13. 开发机侧两轮 review 的结论（2026-08-16）
+
+对 `prepare_v2_data.py` / `dataset_voicedesign.py` / `sft_12hz_voicedesign.py` /
+modeling 三处改动 / 冒烟与启动脚本做了两轮独立审查，12 个问题全部修完。
+**下面几条与上机直接相关**：
+
+### 13.1 装机脚本里有个从未被执行过的 bug（已修）
+
+两个启动脚本的 `pip install -e "$FT_DIR"` 指向 `finetuning/`，而 `pyproject.toml`
+在**仓库根**。脚本带 `set -euo pipefail`，装依赖阶段直接终止，训练一步跑不到。
+
+之所以之前没暴露：上机时是照本指南 §2 手工装的（指南写的是仓库根，没错），
+**脚本里这条从来没真正跑过**。现已改为 `REPO_ROOT`。
+
+### 13.2 两处"证据会静默消失"（已修）
+
+- **`--skip-existing` 续跑会丢掉 `db_range`**：复用产物时不重跑 VAD，该样本永远
+  不会被标成"无动态"。全量跑一半崩了再续跑，`suspicious_vad.jsonl` 就系统性
+  缺失一半内容且无提示。现已在复用分支补算。
+- **`check_ddp_sync.py` 单样本假通过**：jsonl 只有 1 条时各 rank 内容相同，
+  梯度天然一致，即使 allreduce 根本没发生也打 ✅。现会先校验各 rank 喂入是否
+  真的不同，相同则拒绝下结论。
+
+### 13.3 序列布局已 bitwise 确认
+
+review 用 monkeypatch 捕获推理 `generate` 的 prefill embedding，与训练侧
+`collate + V2TrainStep` 构造的逐位对比：**Chinese(nb=5) 与 Auto(nb=4) 两种模式
+max|diff| = 0**。此前只有逐格断言，现在是逐位。
+
+同时确认：404 个参数全部拿到非零梯度（无 DDP unused-parameter 隐患）、
+sub-talker 的 hidden 位置与推理 `past_hidden` 语义一致、
+`text_projection` 路径与推理 bitwise 一致。
+
+### 13.4 一条要知道的边界
+
+`to()` 覆写只在**直接调 `model.to()`** 时生效。若该模型作为子模块被外层
+`nn.Module.to()` 搬运，PyTorch 的 `_apply` 递归**不会**走子模块的 `to()`，
+`speech_tokenizer` 仍会被漏掉。当前训练路径不用 decode、冒烟 s8 是直接调
+`m.model.to()`，都没问题；写新的推理/合成脚本时留意。
+
+---
+
+## 14. 下一轮请跑什么
+
+按顺序，每步完了把数填回对应小节：
+
+| # | 做什么 | 看什么 | 对应小节 |
+|---|---|---|---|
+| 1 | 重跑 §11.1 的 100 条 | **保留比例分位** + **疑似清单**（过切/无动态各多少） | §11.1 |
+| 2 | 抽听 `suspicious_vad.jsonl` 前 10 条 | 是不是强瞬态锁死了参考值 | §8.8 |
+| 3 | 分桶开关对比（bucket 1 vs 64） | s/step 差多少 | §12.4 |
+| 4 | batch 1/4/8 对比 | s/step 与峰值显存 | §12.4 |
+| 5 | 由 3、4 定 batch，重算全量耗时 | | §9.6 |
+
+**第 1、2 步优先**——`--ref-percentile` 要不要动、能不能放心跑全量，全看那两个数。
+第 3 步是这轮代码改动里唯一没在 NPU 上验过的（分桶只在 CUDA 上确认了形状收敛
+12 种 → 1 种，实际提速多少只有昇腾能测）。
+
+
 ## 附：已知会失败的地方（已在代码里处理，列出来备查）
 
 | 项 | 处理 |
