@@ -1864,6 +1864,31 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     
     def load_speech_tokenizer(self, speech_tokenizer):
         self.speech_tokenizer = speech_tokenizer
+
+    def to(self, *args, **kwargs):
+        """搬设备时把 speech_tokenizer 一起带上。
+
+        `Qwen3TTSTokenizer` 是**普通 class 不是 nn.Module**
+        （`inference/qwen3_tts_tokenizer.py:44`），当普通属性挂在这里，
+        `nn.Module.to()` 只递归注册过的子模块，**走不到它**。
+        于是 `model.to("npu:0")` 之后，decode 用的那个 ~170M 编解码器
+        仍留在 CPU —— 推理时逐帧前向全在 CPU 上跑，慢到不可用
+        （昇腾实测：单条合成约 20 分钟、AICore 0%）。
+
+        它不是 nn.Module 这件事本身是有意的（这样 `parameters()` /
+        `state_dict()` 不会混进 codec 权重，checkpoint 才干净），
+        代价就是设备搬迁会漏掉它，需要在这里显式补上。
+        """
+        out = super().to(*args, **kwargs)
+        st = getattr(self, "speech_tokenizer", None)
+        inner = getattr(st, "model", None) if st is not None else None
+        if inner is not None:
+            inner.to(*args, **kwargs)
+            try:  # 同步它自己记录的 device，decode 里会用
+                st.device = next(inner.parameters()).device
+            except StopIteration:
+                pass
+        return out
     
     def load_generate_config(self, generate_config):
         self.generate_config = generate_config

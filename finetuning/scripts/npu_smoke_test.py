@@ -438,18 +438,22 @@ def s8_infer(ckpt_dir, attn, workdir, language):
 
     try:
         # 同 s3：不用 device_map，CPU 加载后整体搬 NPU。
-        # speech_tokenizer 是普通属性不是 nn.Module，.to() 不会递归到它，
-        # 不搬的话 decode 在 CPU 上跑（170M 模型逐帧前向，每条约 20 分钟——实测）
+        # speech_tokenizer 由 Qwen3TTSForConditionalGeneration.to() 的覆写一并搬走
+        # （它是普通属性不是 nn.Module，nn.Module.to() 递归不到它），故这里不用再单独处理
         m = Qwen3TTSModel.from_pretrained(ckpt_dir, torch_dtype=torch.bfloat16,
                                           attn_implementation=attn)
         m.model.to("npu:0")
-        st = getattr(m.model, "speech_tokenizer", None)
-        if st is not None:
-            st.model.to("npu:0")
-            st.device = torch.device("npu:0")
         m.device = torch.device("npu:0")
     except Exception as e:
         return fail(f"微调后的 ckpt 加载失败: {type(e).__name__}: {e}")
+    st = getattr(m.model, "speech_tokenizer", None)
+    if st is not None and getattr(st, "model", None) is not None:
+        d = next(st.model.parameters()).device
+        if d.type != "npu":
+            return fail(f"speech_tokenizer 仍在 {d}",
+                        "decode 会在 CPU 上跑 170M 模型逐帧前向，每条约 20 分钟。\n"
+                        "检查 modeling_qwen3_tts.py 里 to() 的覆写是否还在")
+        ok(f"speech_tokenizer 已在 {d}（decode 不会退回 CPU）")
     ok("微调后的 ckpt 可加载")
 
     text = "帮我把空调温度调低两度"

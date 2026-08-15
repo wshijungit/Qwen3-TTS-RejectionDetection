@@ -309,6 +309,41 @@ Ascend 的 `set_env.sh` 里常有 `export PYTHONPATH=...:$PYTHONPATH` 这类对�
 大概率是单文件，但值得看一眼 ckpt 目录大小。
 
 
+## 8.8 speech_tokenizer 设备搬迁 —— **已在库代码修复**（2026-08-15）
+
+NPU 侧实测「推理像没在用 NPU、每条约 20 分钟、AICore 0%」，根因有二：
+
+**① `speech_tokenizer` 从来没被搬到 NPU。** 它是普通 class 不是 `nn.Module`
+（`inference/qwen3_tts_tokenizer.py:44`），当普通属性挂在模型上，
+`nn.Module.to()` 只递归注册过的子模块，**走不到它**。于是
+`model.to("npu:0")` 之后，decode 用的那个约 170M 编解码器仍留在 CPU，
+逐帧前向全在 CPU 上跑。
+
+> 它不是 `nn.Module` 是有意为之——这样 `parameters()` / `state_dict()`
+> 不会混进 codec 权重，checkpoint 才干净。**同一个设计事实，一面是干净的
+> checkpoint，另一面就是设备搬迁漏掉它。**
+
+**修复**：给 `Qwen3TTSForConditionalGeneration` 加了 `to()` 覆写
+（`modeling_qwen3_tts.py:1868`），搬设备时把 `speech_tokenizer.model` 一起带上
+并同步 `st.device`。一处修好所有调用点，各处不用再各自打补丁。
+冒烟阶段 8 已把原先的临时补丁换成**回归断言**（tokenizer 不在 NPU 上就报错），
+防止以后退回 CPU decode。
+
+开发机验证（CPU 加载 → `.to()`）：
+```
+加载后   主模型 cpu     / tokenizer cpu     st.device=cpu
+.to() 后 主模型 cuda:0  / tokenizer cuda:0  st.device=cuda:0
+```
+
+**② 逐 token 动态形状触发反复编译。** 昇腾算子按形状编译，自回归生成每步
+序列长度 +1，每步都是新形状 → 现场编译（CPU 编译、NPU 等喂）。
+`ACLNN_CACHE_LIMIT`（`npu_env.sh` 已设）缓存后：首次 348s → 第二次 60s。
+
+**这条改不掉，是架构特性。** 但它只影响**推理/批量合成**，
+不影响训练（定长 batch、形状固定，编译一次复用）。等真到批量合成阶段再考虑
+固定长度分档、批量生成摊薄、或合成回 GPU —— 现在不要优化。
+
+
 ## 9. 请 NPU 侧执行并回填
 
 > **先只做 9.1 和 9.2。**
