@@ -65,6 +65,10 @@ LANGUAGE=${LANGUAGE:-Chinese}
 ATTN=${ATTN:-sdpa}
 # fp32（默认）约 25GiB / bf16 约 12.7GiB，910B2 是 64GB，默认走 fp32 更稳
 DTYPE=${DTYPE:-fp32}
+# 每 N 步存一次。全量 1 epoch 是十几小时，只在 epoch 末落盘的话中途崩就全丢
+SAVE_EVERY=${SAVE_EVERY:-500}
+# 序列长度分桶：昇腾按形状编译算子，分桶让编译结果跨 step 复用（NPU 实测省 ~13%）
+LENGTH_BUCKET=${LENGTH_BUCKET:-64}
 
 LOGDIR=${LOGDIR:-${WORK_ROOT}/logs}
 mkdir -p "$OUTPUT_DIR" "$LOGDIR"
@@ -77,6 +81,7 @@ echo "  模型:        $MODEL_PATH"
 echo "  训练数据:    $TRAIN_JSONL"
 echo "  输出:        $OUTPUT_DIR"
 echo "  全局 batch:  $((BATCH_SIZE * GRAD_ACCUM * WORLD))    attn=$ATTN  dtype=$DTYPE"
+echo "  save_every:  $SAVE_EVERY    length_bucket: $LENGTH_BUCKET"
 echo
 
 npu_preflight "$PY"
@@ -104,6 +109,8 @@ cd "$FT_DIR"
     --language "$LANGUAGE" \
     --attn "$ATTN" \
     --dtype "$DTYPE" \
+    --save-every "$SAVE_EVERY" \
+    --length-bucket "$LENGTH_BUCKET" \
     --log_every 10 2>&1 | tee "$LOG"
 
 rc=${PIPESTATUS[0]}

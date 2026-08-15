@@ -235,7 +235,7 @@ def s3_load(model_path, attn):
 # ---------------------------------------------------------------- 4 音频 tokenizer
 
 
-def s4_codes(model_path, workdir, real_jsonl=None, n_synth=8):
+def s4_codes(model_path, workdir, real_jsonl=None, n_synth=8, device="npu:0"):
     stage(4, "音频 tokenizer（抽 audio_codes）")
     import numpy as np
     import soundfile as sf
@@ -278,8 +278,8 @@ def s4_codes(model_path, workdir, real_jsonl=None, n_synth=8):
         # 同 s3：device_map 在 torch 2.1 + torch_npu 上走 meta 加载路径会炸
         tok = Qwen3TTSTokenizer.from_pretrained(
             os.path.join(model_path, "speech_tokenizer"))   # 不传 dtype，与生产路径一致
-        tok.model.to("npu:0")
-        tok.device = torch.device("npu:0")
+        tok.model.to(device)
+        tok.device = torch.device(device)
     except Exception as e:
         return fail(f"tokenizer 加载失败: {type(e).__name__}: {e}",
                     "确认 speech_tokenizer 子目录存在")
@@ -671,7 +671,8 @@ def main():
             ran.add(4)   # 给了 --codes_jsonl 也视为已满足（用户自带产物）
             if not args.codes_jsonl:
                 state["codes"] = s4_codes(args.model_path, wd, args.real_jsonl,
-                                          n_synth=args.synthetic_count)
+                                          n_synth=args.synthetic_count,
+                                          device=args.device)
                 if not state["codes"]:
                     failed.append(4)
                     raise SystemExit

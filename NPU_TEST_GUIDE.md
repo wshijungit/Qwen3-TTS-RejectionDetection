@@ -627,25 +627,82 @@ npu_env.sh 后 TBE 崩溃消失，见命令注释）、阶段 5 七项全 PASS�
 （对机 1.36s / 对人 2.08s），instruct 通路生效。真实数据 smoke 报告见
 `npu_smoke_report_real256.txt`。
 
-### 11.3 定规模后再全量
+### 11.3 全量（参数已由实测定死）
 
-由 11.2 的单步耗时和显存反推 batch size，填 §9.6 的表。
+所有前置都验完了：冒烟 0-8 含 4b 在 NPU 通过、数据准备链路（含断点续跑）通过、
+分桶与 batch 都有实测（§12.6）、VAD 的「过切」疑虑已被量化否定（§14.2）。
 
-**注意**：按**真实数据实测**的 1.2s/step、batch=1 估（11.2 回填），43.5w 条
-1 epoch 约 **145 小时**。显存还有大余量（fp32 只用 25GiB / 61GiB），
-**batch 必须提上去**，否则时间不可接受。这是 11.3 要解决的主要问题。
-粗估：batch=4 单卡约 36 小时，8 卡 DDP 约 4.5 小时（11.2 的 smoke 是
-batch=1 grad_accum=1，正式训练用 debug 脚本的 batch=2/accum=4 全局等效
-batch=8，耗时按吞吐比例折算）。
+#### 结论先行：用 batch=8
 
-全量数据准备本身（输出落在启动脚本的默认数据目录，见 §4 路径表）：
+§12.6 实测 **batch 1→8 时 s/step 几乎不涨、吞吐涨约 8 倍**（0.4 → 3.2 样本/秒），
+与 H200 的 7.7× 一致 —— 说明单步时间几乎全是固定开销，**batch 是唯一有效的杠杆**。
+
+| 配置 | 吞吐 | 43.5w 条 1 epoch |
+|---|---|---|
+| batch=1（最初） | 0.4 样本/秒 | ~145 小时 ❌ |
+| **batch=8 单卡** | **3.2 样本/秒** | **~19-21 小时** ✅ |
+| batch=8 × 8 卡 DDP | 约 25 样本/秒 | ~2.5-3 小时 |
+
+显存：fp32 静态约 25GiB / 61GiB，激活占比极小（H200 上 batch 1→8 显存不变），
+**batch 还能往上试**。真跑 OOM 再降。
+
+#### 第一步：全量数据准备
+
 ```bash
-python prepare_v2_data.py --dataset ... \
-  --out-dir /home/ma-user/work/dataset/duplex_whj_data/v2 \
-  --wav-out-dir /home/ma-user/work/dataset/duplex_whj_data/v2/wav \
+D=/home/ma-user/work/dataset/duplex_whj_data
+cd finetuning
+
+python prepare_v2_data.py \
+  --dataset cc0601 $D/CC_new_0601_0630.jsonl  $D/CC_new_0601_0630_wavs \
+  --dataset cc0701 $D/CC_new_0701_0730.jsonl  $D/CC_new_0701_0730_wavs \
+  --dataset car05  $D/car_all_0415_0424.jsonl $D/car_all_0415_0424_wavs \
+  --out-dir $D/v2 --wav-out-dir $D/v2/wav \
   --workers 32 --skip-existing
 ```
-VAD 预计数小时，trimmed wav 约 50-60GB，`--skip-existing` 可断点续跑。
+
+VAD 数小时，trimmed wav 约 50-60GB。`--skip-existing` 可断点续跑（VAD 参数指纹
+会挡住"改了参数还复用旧产物"）。**`--ref-percentile` 保持默认 100**（§14.2）。
+
+跑完看报告：`wav_not_found` 应为 0、类别偏斜无 ⚠️、
+一致性筛选后 reject 占比比筛前低 5-6 个百分点（预期内）。
+
+#### 第二步：全量抽码
+
+```bash
+python prepare_data.py --device npu:0 \
+  --tokenizer_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign/speech_tokenizer \
+  --input_jsonl $D/v2/train_raw.jsonl --output_jsonl $D/v2/train_codes.jsonl
+```
+
+**这一步现在支持断点续跑**（逐 batch 追加写，重启按已写行数跳过），
+崩了直接重跑同一条命令即可。会每 50 个 batch 打一次进度。
+
+> 已知：batch encode 不具备 padding 不变性，续跑会改变 batch 分组，个别处在
+> VQ 边界上的帧会翻到邻近码字。对音质无影响，但 codes 不逐位可复现。
+
+#### 第三步：正式训练
+
+```bash
+cd scripts
+BATCH_SIZE=8 GRAD_ACCUM=1 EPOCHS=1 \
+DTYPE=fp32 ATTN=sdpa \
+bash run_v2_npu_debug.sh
+```
+
+启动脚本已透传 `SAVE_EVERY`（默认 **500** 步存一次）与 `LENGTH_BUCKET`（默认 64）。
+19-21 小时的 epoch 中途崩掉，只在 epoch 末落盘等于全丢，所以默认就开着。
+磁盘紧张就调大，但别关。
+
+多卡的话先跑一次 `check_ddp_sync.py`（§9.3）确认梯度真的在同步 —— 那个检查在
+NPU 的 HCCL 路径上还没验过。
+
+#### 训练中要盯的
+
+| 项 | 正常 | 异常时 |
+|---|---|---|
+| s/step | 1.2-1.4s（batch=8 稳态） | 明显更高 → 看是不是形状没收敛（§12） |
+| loss 趋势 | **比前 20 步与后 20 步的均值**，别看首末单点 | 几百步不降 → 见 §8.5 |
+| 显存 | 约 25GiB + 激活 | OOM → 降 batch |
 
 
 ## 12. 提速：1.2s/step 的主因是**动态形状反复编译**（已加分桶，待实测）
