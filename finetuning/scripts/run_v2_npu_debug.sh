@@ -12,6 +12,7 @@
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FT_DIR="$(dirname "$HERE")"
+set -euo pipefail   # npu_env.sh 不再设，由各启动脚本自己负责
 . "$HERE/npu_env.sh"
 
 PY=${PY:-python3}
@@ -20,9 +21,9 @@ export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0}
 
 MODEL_PATH=${MODEL_PATH:-/opt/huawei/quoteModel/Qwen3-TTS-12Hz-1.7B-VoiceDesign}
 TOKENIZER_PATH=${TOKENIZER_PATH:-${MODEL_PATH}/speech_tokenizer}
-RAW_JSONL=${RAW_JSONL:-./data_v2/train_raw.jsonl}
-TRAIN_JSONL=${TRAIN_JSONL:-./data_v2/train_codes.jsonl}
-OUTPUT_DIR=${OUTPUT_DIR:-./exp/v2_voicedesign_debug}
+RAW_JSONL=$(realpath -m "${RAW_JSONL:-$FT_DIR/data_v2/train_raw.jsonl}")
+TRAIN_JSONL=$(realpath -m "${TRAIN_JSONL:-$FT_DIR/data_v2/train_codes.jsonl}")
+OUTPUT_DIR=$(realpath -m "${OUTPUT_DIR:-$FT_DIR/exp/v2_voicedesign_debug}")
 
 BATCH_SIZE=${BATCH_SIZE:-2}
 GRAD_ACCUM=${GRAD_ACCUM:-4}
@@ -33,16 +34,21 @@ LANGUAGE=${LANGUAGE:-Chinese}
 # 昇腾上 flash_attention_2 不可用（那是 CUDA kernel）。sdpa 若在 torch_npu 2.1.0
 # 上静默退化到 math 分支导致显存/速度不可接受，改 eager 再试。
 ATTN=${ATTN:-sdpa}
+# fp32（默认）约 25GiB / bf16 约 12.7GiB，910B2 是 64GB，默认走 fp32 更稳
+DTYPE=${DTYPE:-fp32}
 
-mkdir -p "$OUTPUT_DIR" ./logs
-LOG=./logs/v2_npu_debug_$(date +%Y%m%d_%H%M%S).log
+# 必须绝对路径：下面会 cd 到 $FT_DIR，相对路径的 ./logs 会漂到别处，
+# 叠加 set -o pipefail 会让 tee 失败直接终止脚本
+LOGDIR="$FT_DIR/logs"
+mkdir -p "$OUTPUT_DIR" "$LOGDIR"
+LOG="$LOGDIR/v2_npu_debug_$(date +%Y%m%d_%H%M%S).log"
 
 echo "=== V2 VoiceDesign 微调（本机 debug，单卡）==="
 echo "  设备:        $DEVICE  (ASCEND_RT_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES)"
 echo "  模型:        $MODEL_PATH"
 echo "  训练数据:    $TRAIN_JSONL"
 echo "  输出:        $OUTPUT_DIR"
-echo "  bs/accum/lr: $BATCH_SIZE / $GRAD_ACCUM / $LR    attn=$ATTN  language=$LANGUAGE"
+echo "  bs/accum/lr: $BATCH_SIZE / $GRAD_ACCUM / $LR    attn=$ATTN  dtype=$DTYPE  language=$LANGUAGE"
 echo
 
 npu_preflight "$PY"
@@ -75,6 +81,7 @@ echo ">>> 训练"
     --lr "$LR" \
     --language "$LANGUAGE" \
     --attn "$ATTN" \
+    --dtype "$DTYPE" \
     --max_steps "$MAX_STEPS" \
     --log_every 1 2>&1 | tee -a "$LOG"
 

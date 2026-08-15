@@ -26,11 +26,21 @@
 import argparse
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
 import time
 import traceback
+
+# torch_npu 必须在模块级 import：阶段 1/2/3/4/8 都用 torch.npu / "npu:0"，
+# 若只在阶段 0 里 import，单跑 --stages 2 或 4-6 时会抛 AttributeError，
+# 而各阶段的兜底诊断会把它误报成"sdpa 不可用"或"tokenizer 算子不支持"。
+try:
+    import torch_npu  # noqa: F401
+    _NPU_IMPORT_ERR = None
+except Exception as _e:  # noqa: BLE001
+    _NPU_IMPORT_ERR = _e
 
 REPORT = []
 
@@ -65,10 +75,10 @@ def fail(msg, howto=""):
 
 def s0_env():
     stage(0, "环境")
-    try:
-        import torch
-        import torch_npu  # noqa: F401
-    except Exception as e:
+    import torch
+
+    if _NPU_IMPORT_ERR is not None:
+        e = _NPU_IMPORT_ERR
         return fail(
             f"torch_npu 不可用: {type(e).__name__}: {e}",
             "先 source CANN 环境（scripts/npu_env.sh 会做）。\n"
@@ -155,6 +165,15 @@ def s2_attn(model_path):
         try:
             q = torch.randn(2, nh, 512, h // nh, dtype=torch.bfloat16, device="npu:0")
             k, v = q.clone(), q.clone()
+            causal = torch.triu(torch.ones(512, 512, device=q.device, dtype=torch.bool), 1)
+            # warm-up：首次 aclnn 编译开销可达数百毫秒，eager 有 5 个算子要编、
+            # sdpa 只有 1 个，不预热会系统性地把 eager 拉慢
+            for _ in range(3):
+                if impl == "sdpa":
+                    torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+                else:
+                    w = (q @ k.transpose(-1, -2)) / (q.shape[-1] ** 0.5)
+                    torch.softmax(w.masked_fill(causal, float("-inf")), -1) @ v
             torch.npu.synchronize()
             t0 = time.time()
             for _ in range(10):
@@ -162,9 +181,7 @@ def s2_attn(model_path):
                     torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
                 else:
                     w = (q @ k.transpose(-1, -2)) / (q.shape[-1] ** 0.5)
-                    w = w.masked_fill(torch.triu(torch.ones(512, 512, device=q.device,
-                                                            dtype=torch.bool), 1), float("-inf"))
-                    torch.softmax(w, -1) @ v
+                    torch.softmax(w.masked_fill(causal, float("-inf")), -1) @ v
             torch.npu.synchronize()
             results[impl] = time.time() - t0
             ok(f"{impl:6} 可用，10 次耗时 {results[impl]:.3f}s")
@@ -173,7 +190,10 @@ def s2_attn(model_path):
 
     if "sdpa" not in results:
         return fail("sdpa 不可用", "启动脚本传 ATTN=eager")
-    if "eager" in results and results["sdpa"] > results["eager"] * 0.9:
+    if "eager" not in results:
+        warn("eager 未跑成，无对照数据，无法判断 sdpa 是否真的走了融合 kernel")
+        return True
+    if results["sdpa"] > results["eager"] * 0.9:
         warn("sdpa 并不比 eager 快 —— 可能静默退化到 math 分支。\n"
              "     若训练显存/速度不可接受，考虑改用 torch_npu.npu_fusion_attention（需改模型代码）")
     else:
@@ -252,7 +272,7 @@ def s4_codes(model_path, workdir, real_jsonl=None):
     try:
         tok = Qwen3TTSTokenizer.from_pretrained(
             os.path.join(model_path, "speech_tokenizer"),
-            device_map="npu:0", dtype=torch.bfloat16)
+            device_map="npu:0")   # 不传 dtype，与生产路径 prepare_data.py 一致
     except Exception as e:
         return fail(f"tokenizer 加载失败: {type(e).__name__}: {e}",
                     "确认 speech_tokenizer 子目录存在")
@@ -273,8 +293,6 @@ def s4_codes(model_path, workdir, real_jsonl=None):
     with open(out, "w") as f:
         for r in done:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    import numpy as np2  # noqa
-
     shape = (len(done[0]["audio_codes"]), len(done[0]["audio_codes"][0]))
     ok(f"抽码成功，{len(done)} 条，shape={shape}（应为 (T, 16)）")
     if shape[1] != 16:
@@ -299,7 +317,8 @@ def s5_layout(model_path, codes_jsonl, language):
     proc = Qwen3TTSProcessor.from_pretrained(model_path)
     rows = [json.loads(l) for l in open(codes_jsonl)][:2]
     ds = VoiceDesignTTSDataset(rows, proc, cfg, language=language)
-    b = ds.collate_fn([ds[0], ds[1]])
+    items = [ds[0]] if len(ds) < 2 else [ds[0], ds[1]]   # 只有 1 条时不要 IndexError
+    b = ds.collate_fn(items)
     ii, lab = b["input_ids"][0], b["codec_0_labels"][0]
 
     checks = []
@@ -314,11 +333,13 @@ def s5_layout(model_path, codes_jsonl, language):
     nz = (lab != -100).nonzero()
     checks.append(("label 起点 = codec_bos 位", int(nz[0]) == bp))
     checks.append(("label 末位 = codec_eos", int(lab[int(nz[-1])]) == tc.codec_eos_token_id))
-    nb = 5 if language.lower() != "auto" else 4
-    pre = [int(ii[p, 1]) for p in range(bp)]
-    want = tc.codec_think_id if language.lower() != "auto" else tc.codec_nothink_id
-    checks.append((f"codec 前缀首 token = {'think' if nb == 5 else 'nothink'}（block 宽 {nb}）",
-                   want in pre))
+    # 对齐块紧邻在正文之前：从 codec_bos 往前数 = 正文长度 + 1(tts_eos) + nb
+    prefix_expect, _nb = ds._codec_prefix()
+    n_body = ds[0]["text_ids"].shape[1] - 3
+    a = bp - 1 - n_body - _nb
+    got = [int(ii[p, 1]) for p in range(a, a + _nb)]
+    checks.append((f"对齐块 codec 前缀逐格相符（block 宽 {_nb}，{'think' if _nb == 5 else 'nothink'} 开头）",
+                   got == prefix_expect))
     checks.append(("instruct 段 codec_embedding_mask 为 False",
                    not bool(b["codec_embedding_mask"][0, 0, 0])))
     allok = True
@@ -338,9 +359,12 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps, dtype="fp3
     stage(6, f"前反向（{steps} 步，看 loss 是否真的在降）")
     ft = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out = os.path.join(workdir, "ckpt")
-    cmd = (f"cd {ft} && python sft_12hz_voicedesign.py "
-           f"--init_model_path {model_path} --train_jsonl {codes_jsonl} "
-           f"--output_model_path {out} --batch_size 1 --grad_accum 1 "
+    # 用 sys.executable：昇腾 conda 里不保证有 "python" 这个名字，命中时
+    # returncode=127，而 s6 的兜底诊断会误报成 OOM/算子/accelerate 问题
+    cmd = (f"cd {shlex.quote(ft)} && {shlex.quote(sys.executable)} sft_12hz_voicedesign.py "
+           f"--init_model_path {shlex.quote(model_path)} "
+           f"--train_jsonl {shlex.quote(codes_jsonl)} "
+           f"--output_model_path {shlex.quote(out)} --batch_size 1 --grad_accum 1 "
            f"--num_epochs 1 --max_steps {steps} --log_every 1 "
            f"--attn {attn} --language {language} --dtype {dtype} 2>&1")
     log(f"  $ {cmd}\n")
@@ -398,8 +422,9 @@ def s7_ckpt(ckpt_root):
 # ---------------------------------------------------------------- 8 推理
 
 
-def s8_infer(ckpt_dir, attn, workdir):
+def s8_infer(ckpt_dir, attn, workdir, language):
     stage(8, "推理（验证 instruct 通路仍生效）")
+    log(f"  language={language}（必须与训练一致，否则 codec 前缀块宽不同 = 静默失配）")
     import soundfile as sf
     import torch
     from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
@@ -417,7 +442,7 @@ def s8_infer(ckpt_dir, attn, workdir):
     durs = {}
     for tag, s in ins.items():
         try:
-            wavs, sr = m.generate_voice_design(text=text, instruct=s, language="Chinese")
+            wavs, sr = m.generate_voice_design(text=text, instruct=s, language=language)
         except Exception as e:
             return fail(f"生成失败: {type(e).__name__}: {e}")
         p = os.path.join(workdir, f"infer_{tag}.wav")
@@ -511,7 +536,7 @@ def main():
                 failed.append(7)
         if 8 in want and state["ckpt"]:
             ran.add(8)
-            if not s8_infer(state["ckpt"], args.attn, wd):
+            if not s8_infer(state["ckpt"], args.attn, wd, args.language):
                 failed.append(8)
     except SystemExit:
         pass

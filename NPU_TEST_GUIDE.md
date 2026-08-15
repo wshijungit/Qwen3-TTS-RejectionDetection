@@ -39,9 +39,13 @@ exp_avg (m) / exp_avg_sq (v)   : bfloat16      <- Adam 两个动量也是 bf16
 不只是没有 fp32 主权重，**Adam 动量本身也是 bf16**。`exp_avg_sq` 用 8 位尾数
 累积梯度平方，lr 2e-5 下更新量下溢的风险比原先判断的大。
 
-**因此 `--dtype` 默认已改为 `fp32`**（标准混合精度：fp32 权重 + autocast bf16 计算，
-约 27GiB）。910B2 是 64GB，完全吃得下，没有理由为省显存冒收敛风险。
-显存真紧再传 `--dtype bf16`。
+**因此 `--dtype` 默认已改为 `fp32`**（fp32 权重 + autocast bf16 计算，约 25GiB）。
+910B2 是 64GB，完全吃得下，没有理由为省显存冒收敛风险。显存真紧再传 `--dtype bf16`。
+
+> 附带修掉的一个坑：训练循环原先直接调 `model.talker(...)`，**绕过了被 accelerate
+> `prepare` 的模块的 forward**，导致 autocast 完全不生效（fp32 时就是纯 fp32 跑，
+> 慢数倍）、多卡时 DDP 梯度也**完全不同步**（每张卡各训各的，不报错、loss 照降）。
+> 现已把整个计算封进 `V2TrainStep.forward`，两者一并解决。
 
 另有一个已知必踩项：**`transformers` 在那台机器上没装**（`NPU_ENV.md §2` 确认）。
 `pyproject` 要求 4.57.3，其 `requires-python >=3.9.0`，py3.9 可以装。
@@ -55,7 +59,24 @@ exp_avg (m) / exp_avg_sq (v)   : bfloat16      <- Adam 两个动量也是 bf16
 ```bash
 pip install transformers==4.57.3          # requires-python >=3.9.0，py3.9 可用
 pip install -e . --no-deps                # 装 qwen_tts（在仓库根目录），必须 --no-deps
+pip install sox onnxruntime einops "torchaudio==2.1.0"   # --no-deps 漏掉的运行时依赖
 ```
+
+**第三条不能省。** `--no-deps` 只装了 qwen_tts 本身，而 `import qwen_tts` 的依赖链是：
+
+```
+qwen_tts/__init__ → inference/qwen3_tts_model → core/__init__
+  → tokenizer_25hz/modeling_..._v1.py → vq/speech_vq.py  → sox / onnxruntime / torchaudio
+                                       → vq/core_vq.py   → einops
+```
+
+这四个 `NPU_ENV.md §2` 的已装清单里**一个都没有**，不装的话阶段 0 最后一行
+`import qwen_tts` 直接 `ModuleNotFoundError`。
+
+`torchaudio` **必须钉 2.1.0** —— 不钉版本 pip 会拉最新的，其依赖精确钉死
+`torch==2.x`，会把机器上的 torch 2.1.0 顶掉、连带废掉 torch_npu。
+（aarch64 wheel 可用性需上机确认；装不上的话，把 `qwen_tts/core/__init__.py` 里
+25Hz tokenizer 的 import 改成惰性加载亦可——本链路走 12Hz，根本用不到它。）
 
 **`pip install -e .` 必须带 `--no-deps`**，两个原因：
 1. pyproject 钉了 `accelerate==1.12.0`，它要求 py≥3.10，py3.9 下 pip 直接解析失败；
@@ -105,6 +126,9 @@ python npu_smoke_test.py --model_path ... --real_jsonl /path/train_raw.jsonl
 # 多训几步看 loss 趋势（阶段 6 需要阶段 4 的产物，不能只跑 6）
 python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
 
+# 用 bf16 精度测（显存紧时）
+python npu_smoke_test.py --model_path ... --dtype bf16
+
 # 音频码已抽好的话：
 python npu_smoke_test.py --model_path ... --stages 5-6 \
   --codes_jsonl /path/train_codes.jsonl --steps 200
@@ -130,8 +154,13 @@ bash run_v2_npu_cluster.sh
 
 | `--dtype` | 参数/梯度/m/v | 静态显存 | 说明 |
 |---|---|---|---|
-| `fp32`（**默认**） | fp32 | 约 27 GiB | 标准混合精度，收敛更稳 |
+| `fp32`（**默认**） | fp32 | 约 25 GiB | fp32 权重 + autocast bf16 计算，收敛更稳 |
 | `bf16` | 全 bf16 | 约 12.7 GiB | 省显存，但 Adam 动量也是 bf16，有下溢风险 |
+
+（1.7B × 4 份状态 × 4B = 27.2 GB = 25.3 GiB；bf16 那行 1.7B × 4 × 2B = 13.6 GB = 12.7 GiB。
+两行都按 GiB 记。）
+
+正式训练也可用 `DTYPE=bf16 bash run_v2_npu_debug.sh` 切换。
 
 910B2 是 64GB，默认的 fp32 完全吃得下。集群多卡只为吞吐，走 accelerate 原生
 DDP，**不需要 FSDP / ZeRO / MindSpeed**。

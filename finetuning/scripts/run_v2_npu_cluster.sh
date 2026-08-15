@@ -11,6 +11,7 @@
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FT_DIR="$(dirname "$HERE")"
+set -euo pipefail   # npu_env.sh 不再设，由各启动脚本自己负责
 . "$HERE/npu_env.sh"
 
 PY=${PY:-python3}
@@ -43,6 +44,8 @@ EPOCHS=${EPOCHS:-1}
 LR=${LR:-2e-5}
 LANGUAGE=${LANGUAGE:-Chinese}
 ATTN=${ATTN:-sdpa}
+# fp32（默认）约 25GiB / bf16 约 12.7GiB，910B2 是 64GB，默认走 fp32 更稳
+DTYPE=${DTYPE:-fp32}
 
 LOGDIR=${LOGDIR:-${WORK_ROOT}/logs}
 mkdir -p "$OUTPUT_DIR" "$LOGDIR"
@@ -54,7 +57,7 @@ echo "  master:      $MASTER_ADDR:$MASTER_PORT"
 echo "  模型:        $MODEL_PATH"
 echo "  训练数据:    $TRAIN_JSONL"
 echo "  输出:        $OUTPUT_DIR"
-echo "  全局 batch:  $((BATCH_SIZE * GRAD_ACCUM * WORLD))    attn=$ATTN"
+echo "  全局 batch:  $((BATCH_SIZE * GRAD_ACCUM * WORLD))    attn=$ATTN  dtype=$DTYPE"
 echo
 
 npu_preflight "$PY"
@@ -81,6 +84,7 @@ cd "$FT_DIR"
     --lr "$LR" \
     --language "$LANGUAGE" \
     --attn "$ATTN" \
+    --dtype "$DTYPE" \
     --log_every 10 2>&1 | tee "$LOG"
 
 rc=${PIPESTATUS[0]}

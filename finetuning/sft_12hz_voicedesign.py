@@ -53,6 +53,57 @@ def _unwrap(model):
     return model.module if hasattr(model, "module") else model
 
 
+class V2TrainStep(torch.nn.Module):
+    """把「手工拼 embedding + talker 前向 + loss」整个封进一个 forward。
+
+    **不要退回直接调 `model.talker(...)`。** accelerate 的两件事都只作用于被
+    `prepare` 的模块的 `forward`：
+      - `mixed_precision="bf16"` 的 autocast 包的是顶层 forward；
+      - 多卡时 DDP 的梯度 allreduce 由 `DDP.forward` 里的
+        `Reducer::prepare_for_backward()` 触发。
+    绕过 forward 直接调子模块，**autocast 不生效、DDP 也完全不同步**
+    （不报错、loss 照降，每张卡各训各的）。实测：
+        model.talker(x)               -> fp32（未 autocast）
+        with acc.autocast(): talker(x) -> bf16
+    """
+
+    def __init__(self, qwen_model, sub_talker_weight):
+        super().__init__()
+        self.model = qwen_model
+        self.sub_talker_weight = sub_talker_weight
+
+    def forward(self, input_ids, codec_ids, text_embedding_mask,
+                codec_embedding_mask, attention_mask, codec_0_labels, codec_mask):
+        talker = self.model.talker
+
+        # 文本通道：必须过 text_projection，与推理侧一致（见文件头 §1）
+        input_text_embedding = talker.text_projection(
+            talker.model.text_embedding(input_ids[:, :, 0])
+        ) * text_embedding_mask
+        # codec 通道：VoiceDesign 无 speaker 槽位，不注入 speaker_embedding
+        input_codec_embedding = (
+            talker.model.codec_embedding(input_ids[:, :, 1]) * codec_embedding_mask
+        )
+        input_embeddings = input_text_embedding + input_codec_embedding
+
+        for i in range(1, 16):
+            emb = talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+            input_embeddings = input_embeddings + emb * codec_mask.unsqueeze(-1)
+
+        # 不手工 shift —— label 已在 collate 里左移（见文件头 §2）
+        outputs = talker(
+            inputs_embeds=input_embeddings,
+            attention_mask=attention_mask,
+            labels=codec_0_labels,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        hidden_states = outputs.hidden_states[0][-1]
+        return outputs.loss + self.sub_talker_weight * _sub_talker_loss(
+            talker, codec_ids, codec_mask, hidden_states
+        )
+
+
 def _sub_talker_loss(talker, codec_ids, codec_mask, hidden_states):
     """sub-talker（1..15 号码本）的 loss。
 
@@ -88,11 +139,11 @@ def train():
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument(
         "--dtype", choices=["bf16", "fp32"], default="fp32",
-        help="权重精度。bf16 = 参数/梯度/Adam 动量全 bf16（实测 accelerate 的 "
-             "mixed_precision 不额外保留 fp32 主权重），1.7B 静态仅约 12.7GiB，"
-             "但 exp_avg_sq 用 8 位尾数累积梯度平方，lr 2e-5 下更新量有下溢风险；"
-             "fp32 = 标准混合精度（fp32 权重 + autocast bf16 计算），约 27GiB，"
-             "910B2 的 64GB 完全吃得下，收敛更稳。显存不紧就用 fp32")
+        help="权重精度。bf16 = 参数/梯度/Adam 动量全 bf16（AdamW 用 zeros_like 建 "
+             "state，参数 bf16 则动量也是 bf16），1.7B 静态约 12.7GiB，但 exp_avg_sq "
+             "用 8 位尾数累积梯度平方，lr 2e-5 下更新量有下溢风险；"
+             "fp32 = fp32 权重 + autocast bf16 计算（标准混合精度），静态约 25GiB，"
+             "910B2 的 64GB 吃得下，收敛更稳。显存不紧就用 fp32")
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum,
@@ -112,9 +163,10 @@ def train():
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                                   collate_fn=dataset.collate_fn)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    step_module = V2TrainStep(qwen3tts.model, args.sub_talker_loss_weight)
+    optimizer = AdamW(step_module.parameters(), lr=args.lr, weight_decay=0.01)
     model, optimizer, train_dataloader = accelerator.prepare(
-        qwen3tts.model, optimizer, train_dataloader
+        step_module, optimizer, train_dataloader
     )
     model.train()
 
@@ -123,43 +175,8 @@ def train():
     for epoch in range(args.num_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
-                talker = _unwrap(model).talker
-                dev = next(model.parameters()).device
-
-                input_ids = batch["input_ids"].to(dev)
-                codec_ids = batch["codec_ids"].to(dev)
-                text_embedding_mask = batch["text_embedding_mask"].to(dev)
-                codec_embedding_mask = batch["codec_embedding_mask"].to(dev)
-                attention_mask = batch["attention_mask"].to(dev)
-                codec_0_labels = batch["codec_0_labels"].to(dev)
-                codec_mask = batch["codec_mask"].to(dev)
-
-                # 文本通道：必须过 text_projection，与推理侧一致（见文件头 §1）
-                input_text_embedding = talker.text_projection(
-                    talker.model.text_embedding(input_ids[:, :, 0])
-                ) * text_embedding_mask
-                # codec 通道：VoiceDesign 无 speaker 槽位，不注入 speaker_embedding
-                input_codec_embedding = (
-                    talker.model.codec_embedding(input_ids[:, :, 1]) * codec_embedding_mask
-                )
-                input_embeddings = input_text_embedding + input_codec_embedding
-
-                for i in range(1, 16):
-                    emb = talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
-                    input_embeddings = input_embeddings + emb * codec_mask.unsqueeze(-1)
-
-                # 不手工 shift —— label 已在 collate 里左移（见文件头 §2）
-                outputs = talker(
-                    inputs_embeds=input_embeddings,
-                    attention_mask=attention_mask,
-                    labels=codec_0_labels,
-                    output_hidden_states=True,
-                    use_cache=False,
-                )
-                hidden_states = outputs.hidden_states[0][-1]
-                loss = outputs.loss + args.sub_talker_loss_weight * _sub_talker_loss(
-                    talker, codec_ids, codec_mask, hidden_states
-                )
+                # 走 wrapper 的 forward —— autocast 与 DDP 同步都靠它
+                loss = model(**{k: v for k, v in batch.items()})
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -199,8 +216,13 @@ def _save(accelerator, model, args, MODEL_PATH, epoch):
         with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-        sd = {k: v.detach().to("cpu")
-              for k, v in _unwrap(model).state_dict().items()
+        # _unwrap(model) 是 V2TrainStep，真模型在它的 .model 上
+        real = _unwrap(model).model
+        # 无论以什么精度训，一律 bf16 落盘：推理侧默认 bf16，且省一半磁盘。
+        # 三元必须整体括起来，否则 dict comprehension 里优先级会错。
+        sd = {k: (v.detach().cpu().to(torch.bfloat16) if v.is_floating_point()
+                  else v.detach().cpu())
+              for k, v in real.state_dict().items()
               if not k.startswith("speaker_encoder")}   # VoiceDesign 下本就为 None，防御性保留
         # 若源目录是分片 checkpoint，index.json 会让下面写的单文件失效，
         # 加载时静默读回原始权重 → 微调结果丢失
