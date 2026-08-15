@@ -649,16 +649,22 @@ npu_env.sh 后 TBE 崩溃消失，见命令注释）、阶段 5 七项全 PASS�
 #### 第一步：全量数据准备
 
 ```bash
-D=/home/ma-user/work/dataset/duplex_whj_data
+S=/home/ma-user/work/dataset/duplex_whj_data/stc_data
+W=/home/ma-user/work/dataset/duplex_whj_data
 cd finetuning
 
 python prepare_v2_data.py \
-  --dataset cc0601 $D/CC_new_0601_0630.jsonl  $D/CC_new_0601_0630_wavs \
-  --dataset cc0701 $D/CC_new_0701_0730.jsonl  $D/CC_new_0701_0730_wavs \
-  --dataset car05  $D/car_all_0415_0424.jsonl $D/car_all_0415_0424_wavs \
-  --out-dir $D/v2 --wav-out-dir $D/v2/wav \
+  --dataset cc0601 $S/yibuapi_outputs/CC_new_0601_0630/setup1/gemini-3.5-flash/setup1_exp05.jsonl  $W/CC_new_0601_0630_wavs \
+  --dataset cc0701 $S/yibuapi_outputs/CC_new_0701_0730/setup1/gemini-3.5-flash/setup1_exp05.jsonl  $W/CC_new_0701_0730_wavs \
+  --dataset car05  $S/yibuapi_outputs/car_all_0415_0424/setup1/gemini-3.5-flash/setup1_exp05.jsonl $W/car_all_0415_0424_wavs \
+  --out-dir $W/v2 --wav-out-dir $W/v2/wav \
   --workers 32 --skip-existing
 ```
+
+> `$S` / `$W` 与 §11.1 同一套（打标 jsonl 在 `$S/yibuapi_outputs/...`，
+> wav 池在 `$W/..._wavs`）。**此处的路径必须与 §11.1 实测通过的完全一致** ——
+> 早先版本这里写的是 `$D/CC_new_0601_0630.jsonl` 之类的裸文件名，
+> 指南里没有任何步骤生成那些文件，照抄会 FileNotFound。
 
 VAD 数小时，trimmed wav 约 50-60GB。`--skip-existing` 可断点续跑（VAD 参数指纹
 会挡住"改了参数还复用旧产物"）。**`--ref-percentile` 保持默认 100**（§14.2）。
@@ -671,7 +677,7 @@ VAD 数小时，trimmed wav 约 50-60GB。`--skip-existing` 可断点续跑（VA
 ```bash
 python prepare_data.py --device npu:0 \
   --tokenizer_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign/speech_tokenizer \
-  --input_jsonl $D/v2/train_raw.jsonl --output_jsonl $D/v2/train_codes.jsonl
+  --input_jsonl $W/v2/train_raw.jsonl --output_jsonl $W/v2/train_codes.jsonl
 ```
 
 **这一步现在支持断点续跑**（逐 batch 追加写，重启按已写行数跳过），
@@ -703,12 +709,32 @@ bash run_v2_npu_debug.sh
 多卡的话先跑一次 `check_ddp_sync.py`（§9.3）确认梯度真的在同步 —— 那个检查在
 NPU 的 HCCL 路径上还没验过。
 
+#### 中途崩了怎么接着跑
+
+数据准备和抽码都有断点续跑（重跑同一条命令即可）。**训练本体没有 `--resume`**，
+唯一方式是拿最近的 step checkpoint 当新的初始权重重启：
+
+```bash
+cd scripts
+MODEL_PATH=$W/v2/exp/checkpoint-step54000 \
+SKIP_PREPARE=1 BATCH_SIZE=8 GRAD_ACCUM=1 EPOCHS=1 \
+bash run_v2_npu_debug.sh
+```
+
+这是**权重级热启**：optimizer 状态丢失、数据重新 shuffle，但权重接上了。
+对单 epoch 的全量训练够用。
+
+> ckpt 必须完整才能这么用。早先版本的 `_save` 用 `ignore_patterns` 跳过权重时
+> **递归误伤了 `speech_tokenizer/model.safetensors`**（682MB），产出的 ckpt
+> 加载即 `OSError`——`--save-every` 存的盘全是废的、崩了也接不上。已修，
+> 冒烟阶段 7 加了该文件的存在性断言。
+
 #### 训练中要盯的
 
 | 项 | 正常 | 异常时 |
 |---|---|---|
 | s/step | 1.2-1.4s（batch=8 稳态） | 明显更高 → 看是不是形状没收敛（§12） |
-| 磁盘 | 约 11GB（2 个 step ckpt + epoch ckpt） | 涨个不停 → `--save-total-limit` 没生效 |
+| 磁盘 | 约 13GB（2 个 step ckpt + epoch ckpt，每个约 4.3GB 含 speech_tokenizer） | 涨个不停 → `--save-total-limit` 没生效 |
 | loss 趋势 | **比前 20 步与后 20 步的均值**，别看首末单点 | 几百步不降 → 见 §8.5 |
 | 显存 | 约 25GiB + 激活 | OOM → 降 batch |
 

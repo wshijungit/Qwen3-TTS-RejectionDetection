@@ -572,7 +572,10 @@ def s7_ckpt(ckpt_root):
     d = os.path.join(ckpt_root, "checkpoint-epoch-0")
     if not os.path.isdir(d):
         return fail(f"没有产出 {d}", "训练提前退出且未落盘")
-    need = ["config.json", "model.safetensors"]
+    # speech_tokenizer/model.safetensors 必须在：from_pretrained 强制从
+    # <ckpt>/speech_tokenizer 加载，缺了就 OSError，ckpt 等于废的
+    need = ["config.json", "model.safetensors",
+            os.path.join("speech_tokenizer", "model.safetensors")]
     for f in need:
         if not os.path.exists(os.path.join(d, f)):
             return fail(f"缺 {f}")
@@ -715,7 +718,10 @@ def main():
                 state["codes"] = pipe_codes
         if 4 in want:
             ran.add(4)   # 给了 --codes_jsonl 也视为已满足（用户自带产物）
-            if not args.codes_jsonl:
+            # 注意 not (use_pipeline_codes and state["codes"])：4b 在上面已经把
+            # 产物写进 state["codes"]，这里若无条件覆盖，--use-pipeline-codes
+            # 就成了死参数（曾经如此，且文档还写着它生效）
+            if not args.codes_jsonl and not (args.use_pipeline_codes and state["codes"]):
                 state["codes"] = s4_codes(args.model_path, wd, args.real_jsonl,
                                           n_synth=args.synthetic_count,
                                           device=args.device)

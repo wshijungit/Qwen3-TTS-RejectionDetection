@@ -79,9 +79,16 @@ def main():
 
     def flush(fh, lines, audios):
         enc = tokenizer_12hz.encode(audios)
+        # py3.9 没有 zip(strict=True)。若 encode 返回条数少于输入（异常音频等），
+        # 那些行会静默消失，而续跑是按行数跳过的 —— 一旦少一行，之后的
+        # audio/text 与 codes 就整体错位且不报错。宁可当场崩，崩了还能续跑。
+        assert len(enc.audio_codes) == len(lines), (
+            f"encode 返回 {len(enc.audio_codes)} 条但输入 {len(lines)} 条")
         for code, line in zip(enc.audio_codes, lines):
-            line["audio_codes"] = code.cpu().tolist()
-            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+            # 不要写成 line["audio_codes"] = ...：line 是 total_lines 里的 dict，
+            # 原地写入后引用仍在，codes 不会被回收，43.5w 条跑到尾部会积累约 13GB
+            fh.write(json.dumps({**line, "audio_codes": code.cpu().tolist()},
+                                ensure_ascii=False) + "\n")
         fh.flush()
         lines.clear()
         audios.clear()

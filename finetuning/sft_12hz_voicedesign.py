@@ -37,8 +37,10 @@
 import argparse
 import json
 import os
+import re
 import shutil
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from dataset_voicedesign import VoiceDesignTTSDataset
@@ -173,8 +175,20 @@ def train():
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
-    with open(args.train_jsonl) as f:
-        train_data = [json.loads(l) for l in f if l.strip()]
+    # audio_codes 压成 numpy int16 再存：码值 ≤3071，int16 足够。
+    # Python list of int 每个元素是独立对象，43.5w 条实测约 31KB/条 = 13GB/进程，
+    # 8 卡 DDP 各自加载一份 ≈ 104GB/节点，再叠上每 rank 约 7GB 的模型 CPU 副本，
+    # 很可能直接把节点内存打爆。压成 int16 后约 2.5KB/条 = 1.05GB/进程。
+    # Dataset 侧 torch.tensor(..., dtype=torch.long) 吃 numpy int16 无需改动。
+    train_data = []
+    with open(args.train_jsonl, encoding="utf-8") as f:   # encoding 必须给：C locale 下读中文会崩
+        for line in f:
+            if not line.strip():
+                continue
+            d = json.loads(line)
+            if "audio_codes" in d:
+                d["audio_codes"] = np.asarray(d["audio_codes"], dtype=np.int16)
+            train_data.append(d)
     dataset = VoiceDesignTTSDataset(train_data, qwen3tts.processor, config,
                                     language=args.language,
                                     length_bucket=args.length_bucket)
@@ -224,11 +238,19 @@ def _save(accelerator, model, args, MODEL_PATH, tag):
     if accelerator.is_main_process:
         name = f"checkpoint-epoch-{tag}" if isinstance(tag, int) else f"checkpoint-{tag}"
         out_dir = os.path.join(args.output_model_path, name)
-        # 只拷 config/tokenizer 等小文件，跳过权重 —— 权重下面会重新写。
-        # 原先无条件 copytree 整个目录，每次白搬约 3.4GB 再被覆盖，
-        # 全量下每次保存约 8GB I/O。
-        shutil.copytree(MODEL_PATH, out_dir, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("*.safetensors", "*.bin", "*.pt"))
+        # 跳过**顶层**的权重文件（下面会用训练后的权重重写），但子目录里的必须留：
+        # speech_tokenizer/model.safetensors 有 682MB，且 from_pretrained 强制从
+        # <ckpt>/speech_tokenizer 加载（modeling_qwen3_tts.py:1947-1963）。
+        # 用 ignore_patterns 会**递归**作用于每层子目录，把它一起漏掉 —— 产出的
+        # ckpt 加载即 OSError，--save-every 存的盘全是废的、中途崩了也热启不了。
+        def _skip_top_weights(d, names):
+            if os.path.abspath(d) != os.path.abspath(MODEL_PATH):
+                return set()          # 子目录一律照拷
+            return {n for n in names
+                    if n.endswith((".safetensors", ".bin", ".pt"))
+                    and os.path.isfile(os.path.join(d, n))}
+
+        shutil.copytree(MODEL_PATH, out_dir, dirs_exist_ok=True, ignore=_skip_top_weights)
 
         # 保持 voice_design —— 官方脚本这里硬写 custom_voice，产出的 ckpt 会被
         # qwen3_tts_model.py:686 的 != "voice_design" 直接拒掉
@@ -261,9 +283,12 @@ def _save(accelerator, model, args, MODEL_PATH, tag):
         # 滚动清理旧的 step checkpoint（epoch checkpoint 保留）
         if not isinstance(tag, int) and args.save_total_limit > 0:
             root = args.output_model_path
+            # 用正则严格匹配纯数字后缀：有人手工留个 checkpoint-step500.bak 目录，
+            # int("500.bak") 会在第 N 小时抛异常直接搞死训练
             steps = sorted(
                 (d for d in os.listdir(root)
-                 if d.startswith("checkpoint-step") and os.path.isdir(os.path.join(root, d))),
+                 if re.fullmatch(r"checkpoint-step\d+", d)
+                 and os.path.isdir(os.path.join(root, d))),
                 key=lambda d: int(d[len("checkpoint-step"):] or 0),
             )
             for old in steps[: -args.save_total_limit]:
