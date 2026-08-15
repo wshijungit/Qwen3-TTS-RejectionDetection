@@ -223,6 +223,70 @@ Auto 就是静默失配。
 
 ---
 
+## 8. 尚未确认的点（上机时请留意，有结论请回填本节）
+
+以下几条在开发机（CUDA）上无法验证，按「踩到的概率 × 踩到后的代价」排序。
+**遇到任何一条，请把现象补在对应条目下，别只在群里说。**
+
+### 8.1 `torchaudio==2.1.0` 的 aarch64 wheel 是否装得上 —— 阻塞级
+
+§2 第三条依赖里最不确定的一个。装不上就 `import qwen_tts` 直接失败，整条链路起不来。
+
+**兜底方案**（不用装 torchaudio）：把 `qwen_tts/core/__init__.py` 里 25Hz tokenizer
+的 import 改成惰性加载。本链路走 12Hz，`tokenizer_25hz/` 全程用不到，
+`sox` / `onnxruntime` / `torchaudio` / `einops` 四个依赖都是被它拖进来的。
+
+### 8.2 `transformers 4.57.3` 在 torch 2.1.0 上能否正常运行 —— 阻塞级
+
+4.56+ 的 setup 声明 `torch>=2.2`。好消息是 torch 不在它的 `install_requires` 里，
+所以装它**不会**顶掉 torch 2.1.0；坏消息是运行期是否用到 2.2+ 的 API
+（`torch.nn.attention` 系列、新的 pytree 注册等）离线核实不了。
+
+**上机第一步就单独验**：`python -c "import transformers, qwen_tts"`。
+真不兼容的话退到 transformers 4.5x 中支持 py3.9 + torch 2.1 的版本，
+但**必须 ≥ 4.41**（见 §1）。
+
+### 8.3 CANN 的 `set_env.sh` 与 `set -u` —— 中等
+
+两个启动脚本现在自己设 `set -euo pipefail`，且在 source `npu_env.sh` **之前**设。
+Ascend 的 `set_env.sh` 里常有 `export PYTHONPATH=...:$PYTHONPATH` 这类对未设变量的
+裸引用，`set -u` 下会 unbound variable 报错。具体取决于 CANN 版本。
+
+若上机报这个错：把启动脚本里的 `set -euo pipefail` 改成 `set -eo pipefail`（去掉 `-u`）。
+
+### 8.4 `sdpa` 是否真的走融合 kernel —— 影响性能不影响正确性
+
+阶段 2 现在测的是 `is_causal=True` 路径，而**训练实际走的是 4D mask 路径**
+（collate 产出的 `attention_mask` 带 padding 0，transformers 的
+`sdpa_attention_forward` 在 `attention_mask is not None` 时会置 `is_causal=False`
+并传 `attn_mask=`）。这条路在不少后端上不走融合 kernel。
+
+也就是说**阶段 2 的结论未必迁移到训练**。判断依据看实际训练的 step 耗时和显存：
+明显偏离预期就试 `ATTN=eager` 对比。
+
+### 8.5 bf16 下能否收敛 —— 已通过默认值规避，但值得验证
+
+`--dtype` 默认已是 `fp32`，规避了这个风险。若出于显存原因必须用 `bf16`，
+注意此时**参数 / 梯度 / Adam 两个动量全是 bf16**（`torch.optim.AdamW` 用
+`zeros_like(p)` 建 state）。`exp_avg_sq` 用 8 位尾数累积梯度平方，lr 2e-5 下
+更新量有下溢风险。跑几百步看 loss 是真降还是在抖。
+
+### 8.6 多卡梯度同步 —— 已修，但没在真多卡上验证过
+
+`14c3e42` 把计算封进 `V2TrainStep.forward` 后，DDP 的 allreduce 应该恢复了，
+但开发机上只做了单卡验证。
+
+**上机跑多卡时请验一次**：训练几步后比对两个 rank 上同一个权重张量的
+`.sum()`，应完全相同。不同就说明还在各训各的。
+
+### 8.7 分片 checkpoint 的孤儿文件 —— 低
+
+`_save` 用 `shutil.copytree` 把源模型目录整份拷过来再覆盖 `model.safetensors`，
+并删掉 `index.json`。若源目录是分片格式，**shard 文件本身不会被删**，
+每个 epoch 目录会多出若干 GB 的孤儿文件。1.7B bf16 约 3.4GB < 5GB 默认分片阈值，
+大概率是单文件，但值得看一眼 ckpt 目录大小。
+
+
 ## 附：已知会失败的地方（已在代码里处理，列出来备查）
 
 | 项 | 处理 |
