@@ -146,15 +146,24 @@ python npu_smoke_test.py --model_path ... --stages 5-6 \
 冒烟过了之后：
 
 ```bash
-# 单卡 debug（数据走默认路径 $FT_DIR/data_v2/train_{raw,codes}.jsonl）
+# 单卡 debug（默认路径见下，与参考仓库约定对齐）
 cd finetuning/scripts
-MODEL_PATH=/path/VoiceDesign bash run_v2_npu_debug.sh
-# 要覆盖数据路径请传绝对路径：脚本里 RAW_JSONL/TRAIN_JSONL 会 realpath，
-# 相对路径按脚本启动目录（finetuning/scripts）解析，不是 $FT_DIR
+bash run_v2_npu_debug.sh
 
 # ModelArts 集群（作业变量由平台注入）
 bash run_v2_npu_cluster.sh
 ```
+
+**路径约定（对齐 duplex_huanyu_qwen35 / MiMo v2 脚本）**：
+
+| 用途 | debug 机 | 集群 |
+|---|---|---|
+| 模型 | `/home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | `/opt/huawei/quoteModel/...` |
+| 数据 | `/home/ma-user/work/dataset/duplex_whj_data/v2/train_{raw,codes}.jsonl` | `/opt/huawei/dataset/...` |
+| 输出 | `/home/ma-user/work/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/debug` | `/opt/huawei/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/${RUN_NAME:-v1}` |
+
+覆盖一律传**绝对路径**：脚本里 `RAW_JSONL/TRAIN_JSONL` 会 realpath，相对路径按脚本
+启动目录解析，容易漂。
 
 两个启动脚本都**内置依赖安装**（§2 三条 + accelerate/safetensors/librosa/soundfile
 钉版本），`SKIP_INSTALL=1` 可跳过——与参考仓库 `duplex_huanyu_qwen35/pretrain_al_cls.sh`
@@ -526,7 +535,9 @@ loss 从 3.6 降到 1.1，**确认在真降不是抖**——bf16 之外的收敛
      （打标 jsonl + 扁平 wav 池 → `{audio, text, instruct}` + VAD 切静音），
      三份数据直接可用。建议先 `--limit 100` sanity check 再全量
      （全量 43.5 万条 VAD 预计数小时，`--skip-existing` 断点续跑；
-     全量 trimmed wav 约 50-60GB）。
+     全量 trimmed wav 约 50-60GB）。输出按上表路径约定：
+     `--out-dir /home/ma-user/work/dataset/duplex_whj_data/v2`
+     （train_raw/valid_raw 直接落在启动脚本的默认数据目录）。
 
 
 ## 11. 接真实数据（下一步）
@@ -539,18 +550,19 @@ loss 从 3.6 降到 1.1，**确认在真降不是抖**——bf16 之外的收敛
 ### 11.1 先 100 条 sanity check
 
 ```bash
-D=/opt/huawei/dataset/duplex_whj_data
+S=/home/ma-user/work/dataset/stc_data/dataset/cabin_duplex_data_artif
+W=/home/ma-user/work/dataset/duplex_whj_data
 cd finetuning
 
 python prepare_v2_data.py \
-  --dataset cc0601 $D/CC_new_0601_0630.jsonl      $D/CC_new_0601_0630_wavs \
-  --dataset cc0701 $D/CC_new_0701_0730.jsonl      $D/CC_new_0701_0730_wavs \
-  --dataset car05  $D/car_all_0415_0424.jsonl     $D/car_all_0415_0424_wavs \
+  --dataset cc0601 $S/yibuapi_outputs/CC_new_0601_0630/setup1/gemini-3.5-flash/setup1_exp05.jsonl  $W/CC_new_0601_0630_wavs \
+  --dataset cc0701 $S/yibuapi_outputs/CC_new_0701_0730/setup1/gemini-3.5-flash/setup1_exp05.jsonl  $W/CC_new_0701_0730_wavs \
+  --dataset car05  $S/yibuapi_outputs/car_all_0415_0424/setup1/gemini-3.5-flash/setup1_exp05.jsonl $W/car_all_0415_0424_wavs \
   --out-dir ./data_v2_smoke --wav-out-dir /tmp/v2_wav_smoke \
   --limit 100 --workers 16 --val-size 10
 ```
 
-（jsonl 的确切文件名以实际为准，上面按 §10.6 的命名写。）
+（集群对应 `/opt/huawei/dataset/...`，只换前缀。）
 
 **要看的（脚本会自己打印）**：
 
@@ -567,13 +579,14 @@ gemini 数据上跑转写**，之前都是合成样本。
 ### 11.2 小批量真实数据训一次
 
 ```bash
+MDL=/home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 head -256 data_v2_smoke/train_raw.jsonl > /tmp/real256.jsonl
 python prepare_data.py --device npu:0 \
-  --tokenizer_model_path <VoiceDesign>/speech_tokenizer \
+  --tokenizer_model_path $MDL/speech_tokenizer \
   --input_jsonl /tmp/real256.jsonl --output_jsonl /tmp/real256_codes.jsonl
 
 cd scripts
-python npu_smoke_test.py --model_path <VoiceDesign> \
+python npu_smoke_test.py --model_path $MDL \
   --codes_jsonl /tmp/real256_codes.jsonl --stages 5-8 --steps 200
 ```
 
@@ -590,10 +603,12 @@ python npu_smoke_test.py --model_path <VoiceDesign> \
 显存还有大余量（fp32 只用 25GiB / 61GiB），**batch 必须提上去**，
 否则时间不可接受。这是 11.3 要解决的主要问题。
 
-全量数据准备本身：
+全量数据准备本身（输出落在启动脚本的默认数据目录，见 §4 路径表）：
 ```bash
-python prepare_v2_data.py --dataset ... --out-dir ./data_v2 \
-  --wav-out-dir /path/big_disk --workers 32 --skip-existing
+python prepare_v2_data.py --dataset ... \
+  --out-dir /home/ma-user/work/dataset/duplex_whj_data/v2 \
+  --wav-out-dir /home/ma-user/work/dataset/duplex_whj_data/v2/wav \
+  --workers 32 --skip-existing
 ```
 VAD 预计数小时，trimmed wav 约 50-60GB，`--skip-existing` 可断点续跑。
 

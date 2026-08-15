@@ -54,7 +54,7 @@ netstat -tuln | grep ${MASTER_PORT} || echo "端口 ${MASTER_PORT} 空闲"
 
 MODEL_PATH=${MODEL_PATH:-${WORK_ROOT}/quoteModel/Qwen3-TTS-12Hz-1.7B-VoiceDesign}
 TRAIN_JSONL=${TRAIN_JSONL:-${WORK_ROOT}/dataset/duplex_whj_data/v2/train_codes.jsonl}
-OUTPUT_DIR=${OUTPUT_DIR:-${WORK_ROOT}/quoteModel/exp/v2_voicedesign}
+OUTPUT_DIR=${OUTPUT_DIR:-${WORK_ROOT}/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/${RUN_NAME:-v1}}
 
 BATCH_SIZE=${BATCH_SIZE:-4}
 GRAD_ACCUM=${GRAD_ACCUM:-2}

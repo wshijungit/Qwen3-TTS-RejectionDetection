@@ -31,11 +31,15 @@ fi
 DEVICE=${DEVICE:-npu:0}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0}
 
-MODEL_PATH=${MODEL_PATH:-/opt/huawei/quoteModel/Qwen3-TTS-12Hz-1.7B-VoiceDesign}
+# 路径约定对齐参考仓库（duplex_huanyu_qwen35 与 MiMo v2 脚本）：
+#   模型  /home/ma-user/work/model/...                        （集群 /opt/huawei/quoteModel）
+#   数据  /home/ma-user/work/dataset/duplex_whj_data/v2/...   （集群 /opt/huawei/dataset）
+#   输出  /home/ma-user/work/quoteModel/duplex_whj_exp/...    （集群 /opt/huawei/quoteModel）
+MODEL_PATH=${MODEL_PATH:-/home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign}
 TOKENIZER_PATH=${TOKENIZER_PATH:-${MODEL_PATH}/speech_tokenizer}
-RAW_JSONL=$(realpath -m "${RAW_JSONL:-$FT_DIR/data_v2/train_raw.jsonl}")
-TRAIN_JSONL=$(realpath -m "${TRAIN_JSONL:-$FT_DIR/data_v2/train_codes.jsonl}")
-OUTPUT_DIR=$(realpath -m "${OUTPUT_DIR:-$FT_DIR/exp/v2_voicedesign_debug}")
+RAW_JSONL=$(realpath -m "${RAW_JSONL:-/home/ma-user/work/dataset/duplex_whj_data/v2/train_raw.jsonl}")
+TRAIN_JSONL=$(realpath -m "${TRAIN_JSONL:-/home/ma-user/work/dataset/duplex_whj_data/v2/train_codes.jsonl}")
+OUTPUT_DIR=$(realpath -m "${OUTPUT_DIR:-/home/ma-user/work/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/debug}")
 
 BATCH_SIZE=${BATCH_SIZE:-2}
 GRAD_ACCUM=${GRAD_ACCUM:-4}
