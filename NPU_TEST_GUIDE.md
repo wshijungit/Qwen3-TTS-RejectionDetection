@@ -287,6 +287,112 @@ Ascend 的 `set_env.sh` 里常有 `export PYTHONPATH=...:$PYTHONPATH` 这类对�
 大概率是单文件，但值得看一眼 ckpt 目录大小。
 
 
+## 9. 请 NPU 侧执行并回填
+
+下面是**开发机上做不了、必须上机测**的项。按顺序做，把结果填进「实测」列，
+连同 `npu_smoke_report.txt` 一起推回来。任何一步失败就停下，把现象补进 §8 对应条目。
+
+### 9.1 装完先验 import（对应 §8.1 / §8.2，两条阻塞项）
+
+```bash
+python -c "import torch, torch_npu; print(torch.__version__, torch_npu.__version__)"
+python -c "import transformers; print(transformers.__version__)"
+python -c "import qwen_tts; print('qwen_tts OK')"
+```
+
+| 项 | 预期 | 实测 |
+|---|---|---|
+| torch / torch_npu | 2.1.0 / 2.1.0.post8 | |
+| transformers | ≥ 4.41（目标 4.57.3） | |
+| `import qwen_tts` | 无报错 | |
+| `torchaudio==2.1.0` 装上了吗 | 是 | |
+
+装不上 torchaudio 就走 §8.1 的兜底（25Hz tokenizer 改惰性 import）。
+
+### 9.2 冒烟测试
+
+```bash
+cd finetuning/scripts && . ./npu_env.sh
+python npu_smoke_test.py --model_path <VoiceDesign 目录>
+```
+
+| 阶段 | 要回填的数 | 实测 |
+|---|---|---|
+| 1 | bf16 matmul 耗时、显存总量 | |
+| 2 | sdpa 耗时 / eager 耗时 | |
+| 4 | audio_codes shape | |
+| 5 | 7 项是否全 PASS | |
+| 6 | loss 首值 → 末值 | |
+| 8 | 两条 instruct 的时长差 % | |
+
+### 9.3 多卡梯度同步（对应 §8.6）
+
+**多卡正式训练前必做。** 开发机上只有 CUDA，NPU 的 HCCL 路径没验过。
+
+```bash
+torchrun --nproc_per_node 2 check_ddp_sync.py \
+    --model_path <VoiceDesign> --train_jsonl <train_codes.jsonl>
+```
+
+各 rank 喂不同样本，梯度同步正常则 `grad.sum()` 完全一致。
+开发机 2×H200 上的参考输出：
+
+```
+各 rank 的 grad.sum(): ['-6.535583e-01', '-6.535583e-01']
+✅ 梯度已同步（各 rank 一致）—— DDP allreduce 正常
+```
+
+| 项 | 预期 | 实测 |
+|---|---|---|
+| 各 rank grad.sum() | 完全一致 | |
+
+打 ❌ 就**不要跑多卡正式训练**，等于白跑。
+
+### 9.4 真实训练路径下的 sdpa vs eager（对应 §8.4）
+
+阶段 2 测的是 `is_causal=True` 的合成 benchmark，而训练走的是 4D mask 路径，
+**结论未必迁移**。用真实训练各跑一次对比：
+
+```bash
+for A in sdpa eager; do
+  ATTN=$A MAX_STEPS=20 OUTPUT_DIR=/tmp/attn_$A bash run_v2_npu_debug.sh
+done
+```
+
+| ATTN | 20 步耗时 | 峰值显存（npu-smi） | 实测 |
+|---|---|---|---|
+| sdpa | | | |
+| eager | | | |
+
+sdpa 不比 eager 快就说明没走融合 kernel，按快的那个定 §4 的默认值。
+
+### 9.5 收敛趋势（对应 §8.5）
+
+默认 `--dtype fp32` 已规避 bf16 的下溢风险，但仍要确认 loss 是真降不是抖：
+
+```bash
+python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
+```
+
+| 项 | 实测 |
+|---|---|
+| 200 步 loss 首 / 中 / 末 | |
+| 单步耗时 | |
+
+有余力再跑一次 `--dtype bf16` 对比，能直接回答 §8.5。
+
+### 9.6 定正式训练的规模
+
+上面几项跑完就能算了：
+
+| 项 | 来自 | 实测 |
+|---|---|---|
+| 单步耗时（batch=2） | 9.5 | |
+| 峰值显存 | 9.4 | |
+| 可用的 batch_size | 由显存反推 | |
+| 43.5w 条 1 epoch 预估耗时 | 单步耗时 × 步数 | |
+
+
 ## 附：已知会失败的地方（已在代码里处理，列出来备查）
 
 | 项 | 处理 |
