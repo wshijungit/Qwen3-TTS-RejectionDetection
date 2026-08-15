@@ -437,10 +437,16 @@ def s8_infer(ckpt_dir, attn, workdir, language):
     from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
     try:
-        # 同 s3：不用 device_map，CPU 加载后整体搬 NPU
+        # 同 s3：不用 device_map，CPU 加载后整体搬 NPU。
+        # speech_tokenizer 是普通属性不是 nn.Module，.to() 不会递归到它，
+        # 不搬的话 decode 在 CPU 上跑（170M 模型逐帧前向，每条约 20 分钟——实测）
         m = Qwen3TTSModel.from_pretrained(ckpt_dir, torch_dtype=torch.bfloat16,
                                           attn_implementation=attn)
         m.model.to("npu:0")
+        st = getattr(m.model, "speech_tokenizer", None)
+        if st is not None:
+            st.model.to("npu:0")
+            st.device = torch.device("npu:0")
         m.device = torch.device("npu:0")
     except Exception as e:
         return fail(f"微调后的 ckpt 加载失败: {type(e).__name__}: {e}")

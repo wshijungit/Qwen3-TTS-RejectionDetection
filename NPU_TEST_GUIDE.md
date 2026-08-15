@@ -353,7 +353,7 @@ python npu_smoke_test.py --model_path <VoiceDesign 目录>
 | 4 | audio_codes shape | ✅ (32, 16) |
 | 5 | 7 项是否全 PASS | ✅ 7/7 PASS |
 | 6 | loss 首值 → 末值 | ✅ 3.7002 → 3.6943（6 步，步数少基本持平属正常） |
-| 8 | 两条 instruct 的时长差 % | ✅ 10.5%（对机 2.72s / 对人 3.04s） |
+| 8 | 两条 instruct 的时长差 % | ✅ 10.5%（对机 2.72s / 对人 3.04s）；修复 decode 未上 NPU 后复测：首次 348s（含逐形状编译预热）/ 二次 60s，时长差 82.6%——采样随机性导致波动大，此判据是弱信号 |
 
 **结论：阶段 0-8 全部通过 ✅（2026-08-15，910B1 单卡），训练链路在 NPU 上跑通。**
 模型路径：`/home/ma-user/work/dataset/wsj-mimo-data/Qwen3-TTS-ckpt`。
@@ -456,11 +456,19 @@ python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
    的 dist-info），普通 pip 卸载时报 `Permission denied: 'METADATA'`。user site
    优先级更高正好覆盖（§2 已写明）。
 
-5. **阶段 8 推理极慢，训练 step 正常**：两条 instruct 各花了约 20 分钟，期间
-   CPU 92% / AICore 0%（CPU-bound，疑似逐 token 小算子 launch 开销）。
-   这不影响训练吞吐（阶段 6 的 6 步含编译总共几分钟），但 9.6 的规模估算要
-   把训练 step 耗时和推理时延分开算；推理侧的耗时留待 9.4/9.5 一起复测。
-   （另：sox CLI 缺失的告警无害——python sox 包可用，12Hz 链路不依赖 CLI。）
+5. **阶段 8 推理慢的根因定位（两次实测对比）**：
+   - 第一次跑：两条各 ~10/~20 分钟，CPU 92% / AICore 0%。两个原因叠加——
+     ① `speech_tokenizer` 是**普通属性不是 nn.Module**，`.to("npu:0")` 不递归到
+     它，decode（170M 模型逐帧前向）一直留在 CPU；② 生成循环逐 token 动态形状，
+     每步触发 aclnn 内核编译（CPU 编译、NPU 等喂指令）。
+   - 修掉 ① 后复测：**首次生成 348s → 第二次 60s**。差距即编译预热：
+     第二次的形状全部命中 ACLNN_CACHE_LIMIT=1000 的编译缓存。NPU 确实在算
+     （HBM 4→8GB、AICore 4-10% 波动、训练 step 正常）。
+   - 残留的 60s 仍比 CUDA 慢不少（小算子 launch + 4D mask sdpa 路径，正是
+     §8.4 的疑问），留待 9.4 复测；训练吞吐不受此影响（阶段 6 几步含编译几分钟）。
+   - 另：两次实测时长差 10.5% vs 82.6%，`do_sample=True` 随机性大，
+     阶段 8 的时长差判据只能当弱信号，腔调对不对最终以听辨为准。
+   （sox CLI 缺失的告警无害——python sox 包可用，12Hz 链路不依赖 CLI。）
 
 
 ## 附：已知会失败的地方（已在代码里处理，列出来备查）
@@ -564,4 +572,6 @@ python npu_smoke_test.py --model_path ... --stages 4-6 --steps 200
 3. `device_map` meta 加载路径在 torch 2.1 + torch_npu 上必崩 →
    冒烟 s3/s4/s8 与 prepare_data.py 改为 CPU 加载 + `.to("npu:0")`
 4. 芯片型号 910B2 → **910B1**（npu-smi 与 torch 实测），NPU_ENV.md 同步更正
-5. 阶段 8 推理 CPU-bound 极慢（每条 ~20 分钟，AICore 0%），记入 §10.5 待 9.4/9.5 复测
+5. 阶段 8 推理慢：定位为「speech_tokenizer 普通属性没被 .to() 搬到 NPU（decode 留
+   CPU）」+「逐 token 动态形状 aclnn 编译预热」。前者已修（冒烟 s8），后者实测
+   首次 348s / 二次 60s（缓存命中），记入 §10.5 待 9.4/9.5 复测
