@@ -12,6 +12,7 @@
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FT_DIR="$(dirname "$HERE")"
+REPO_ROOT="$(dirname "$FT_DIR")"   # pyproject.toml 在仓库根，不在 finetuning/
 set -euo pipefail   # npu_env.sh 不再设，由各启动脚本自己负责
 . "$HERE/npu_env.sh"
 
@@ -25,7 +26,7 @@ PY=${PY:-python3}
 if [ "${SKIP_INSTALL:-0}" != "1" ]; then
     pip install --user transformers==4.55.2 "accelerate==1.0.0" "safetensors>=0.4.5" \
         sox onnxruntime einops librosa soundfile "torchaudio==2.1.0" 2>&1 | tail -3
-    pip install --user -e "$FT_DIR" --no-deps 2>&1 | tail -3
+    pip install --user -e "$REPO_ROOT" --no-deps 2>&1 | tail -3
 fi
 
 DEVICE=${DEVICE:-npu:0}

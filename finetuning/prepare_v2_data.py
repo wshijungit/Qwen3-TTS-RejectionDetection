@@ -175,6 +175,18 @@ def _get_silero(model_path):
     return _SILERO
 
 
+def _db_range_of(wav):
+    """只算帧间 dB 动态范围，不做裁剪。给 --skip-existing 复用产物时补证据用。"""
+    FRAME, HOP = 2048, 512
+    if wav.size < FRAME:
+        return {}
+    n = 1 + (wav.size - FRAME) // HOP
+    c = np.concatenate(([0.0], np.cumsum(wav.astype(np.float64) ** 2)))
+    rms = np.sqrt((c[FRAME::HOP][:n] - c[0 : n * HOP : HOP]) / FRAME)
+    db = 20.0 * np.log10(np.maximum(rms, 1e-10))
+    return {"db_range": float(db.max() - db.min())}
+
+
 def trim_silence(wav, sr, mode, top_db, silero_path, ref_percentile=None):
     """
     只切首尾静音，不动句中停顿——句中停顿是腔调的一部分。
@@ -219,15 +231,8 @@ def trim_silence(wav, sr, mode, top_db, silero_path, ref_percentile=None):
         # 只有把 min-dur 调到 0.128 以下、或源采样率高于 16k 时行为才分叉。
         return wav[:0], False, {}
     n = 1 + (wav.size - FRAME) // HOP
-    frames = np.lib.stride_tricks.as_strided(
-        wav,
-        shape=(n, FRAME),
-        strides=(wav.strides[0] * HOP, wav.strides[0]),
-        writeable=False,
-    )
-    # 用累积和算逐帧 RMS：frames.astype(float64) 会把 strided view 实体化成
-    # N×2048×8 字节的真拷贝（10 分钟音频 ≈ 300MB/worker，32 worker 会 OOM）。
-    # 数值与逐帧 mean 一致（实测最大绝对误差 5.6e-14，选帧完全相同）。
+    # 用累积和算逐帧 RMS（避免把 strided view 实体化成 N×2048×8 的真拷贝：
+    # 10 分钟音频约 300MB/worker，32 worker 会 OOM）。数值与逐帧直算一致。
     c = np.concatenate(([0.0], np.cumsum(wav.astype(np.float64) ** 2)))
     rms = np.sqrt((c[FRAME::HOP][:n] - c[0 : n * HOP : HOP]) / FRAME)
 
@@ -278,6 +283,15 @@ def process_one(job):
             cand = info.frames / info.samplerate
             if cand >= cfg["min_dur"]:
                 dur_after = cand
+                # 复用产物时不重跑 VAD，但 db_range 必须补算，否则"无动态"这一类
+                # 疑似样本在续跑后会系统性缺失（纯底噪判不出全靠它出证据）
+                try:
+                    w2, sr2 = sf.read(dst, dtype="float32", always_2d=False)
+                    if w2.ndim > 1:
+                        w2 = w2.mean(axis=1)
+                    vad_info = _db_range_of(w2)
+                except Exception:
+                    pass
                 try:
                     si = sf.info(src)
                     dur_before = si.frames / si.samplerate
@@ -621,7 +635,9 @@ def main():
     )
     ap.add_argument("--min-dur", type=float, default=0.3, help="VAD 后短于此秒数则丢弃")
     ap.add_argument(
-        "--val-size", type=int, default=500, help="验证集条数（至少 1，训练配了 eval_strategy）"
+        "--val-size", type=int, default=500,
+        help="划出多少条作人工评测 holdout。注意：sft_12hz_voicedesign.py 目前**没有**"
+             "eval 逻辑，valid_raw.jsonl 不参与训练、也无人自动消费，纯粹是预留"
     )
     ap.add_argument(
         "--limit",
@@ -649,7 +665,7 @@ def main():
     if len(names) != len(set(names)):
         ap.error(f"--dataset 名称重复会共用输出目录并覆盖统计: {names}")
     if args.val_size < 1:
-        ap.error("--val-size 至少为 1：训练脚本配了 eval_strategy=steps，空验证集会在首次 eval 时崩")
+        ap.error("--val-size 至少为 1")
 
     random.seed(args.seed)
     # 下游 prepare_data.py 的 cwd 与本脚本不同，写进 jsonl 的必须是绝对路径
@@ -790,6 +806,10 @@ def main():
 
     val_n = min(args.val_size, max(1, len(all_samples) // 10))
     val, train = all_samples[:val_n], all_samples[val_n:]
+    if not train:
+        print(f"\n❌ 训练集为空（总共只有 {len(all_samples)} 条，全被划给验证集）。"
+              f"\n   --limit 调大，或把 --val-size 调小。", file=sys.stderr)
+        sys.exit(1)
 
     train_path = os.path.join(args.out_dir, "train_raw.jsonl")
     val_path = os.path.join(args.out_dir, "valid_raw.jsonl")

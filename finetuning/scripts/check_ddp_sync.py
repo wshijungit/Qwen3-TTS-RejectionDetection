@@ -61,6 +61,7 @@ def main():
     with open(args.train_jsonl) as f:
         rows = [json.loads(l) for l in f if l.strip()]
     if len(rows) < acc.num_processes:
+        # 不足则复制，但下面会校验各 rank 实际喂入是否真的不同
         rows = (rows * acc.num_processes)[: acc.num_processes]
     ds = VoiceDesignTTSDataset(rows, q.processor, cfg, language=args.language)
 
@@ -71,6 +72,19 @@ def main():
     batch = ds.collate_fn([ds[idx]])
     batch = {k: v.to(acc.device) for k, v in batch.items()}
     acc.print(f"共 {acc.num_processes} 个进程，各喂不同样本")
+
+    # 各 rank 必须真的喂到**不同**内容：若数据只有 1 条（或去重后 1 条），
+    # rows*num_processes 复制出来的样本内容完全相同，此时即使 allreduce 根本
+    # 没发生，各 rank 梯度也天然一致 —— 会打出假的"✅ 已同步"。
+    # 这个脚本是防"绕过 forward 导致 DDP 静默失效"的最后一道防线，假阳性等于没有。
+    fp = batch["input_ids"].double().sum().reshape(1).to(acc.device)
+    all_fp = acc.gather(fp).cpu()
+    if acc.is_main_process and float(all_fp.max() - all_fp.min()) == 0.0:
+        print("❌ 各 rank 喂入的 batch 完全相同，本检查无法区分"
+              "「梯度已同步」与「梯度根本没同步」。\n"
+              f"   请提供至少 {acc.num_processes} 条**不同**样本的 jsonl。")
+        sys.exit(1)
+    acc.wait_for_everyone()
 
     loss = model(**batch)
     acc.backward(loss)
