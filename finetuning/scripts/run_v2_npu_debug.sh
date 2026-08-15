@@ -1,8 +1,9 @@
 #!/bin/bash
 # V2 VoiceDesign 微调 —— 本机 debug 版（单卡 910B2 / 64GB）。
 #
-# 1.7B 全参微调静态显存约 27GB（16N：bf16 参数 3.4 + 梯度 3.4 + fp32 master 6.8
-# + Adam m/v 13.6），64GB 单卡装得下 —— **不需要任何分布式**，直接 python 起，
+# 1.7B 全参微调静态显存约 21GB（bf16 参数 3.4 + 梯度 3.4 + Adam m/v fp32 13.6；
+# accelerate 的 bf16 混合精度不保留 fp32 主权重），64GB 单卡装得下 ——
+# **不需要任何分布式**，直接 python 起，
 # 不用 torchrun、不用 FSDP、不用 MindSpeed。
 #
 #   bash run_v2_npu_debug.sh                      # 用默认路径

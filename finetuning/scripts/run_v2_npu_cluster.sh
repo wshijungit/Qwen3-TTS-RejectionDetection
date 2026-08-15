@@ -4,7 +4,7 @@
 # 与 debug 版的唯一区别是**分布式与路径来源**，训练代码保持 device 无关。
 # 设备可见性交给 ModelArts 调度，**不要**自设 ASCEND_RT_VISIBLE_DEVICES。
 #
-# 注意：1.7B 全参微调单卡约 27GB，910B2 是 64GB —— 多卡在这里是**为了吞吐**，
+# 注意：1.7B 全参微调单卡约 21GB，910B2 是 64GB —— 多卡在这里是**为了吞吐**，
 # 不是因为放不下。走 accelerate 原生 DDP（数据并行），不需要 FSDP/ZeRO/MindSpeed。
 #
 # backend 写 nccl：torch_npu 会自动映射到 hccl（团队脚本通用写法）。

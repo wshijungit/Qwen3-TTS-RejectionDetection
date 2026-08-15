@@ -131,8 +131,8 @@ def s1_ops():
     try:
         free, total = torch.npu.mem_get_info(0)
         ok(f"显存 {free / 2**30:.1f} / {total / 2**30:.1f} GiB 可用")
-        if total / 2**30 < 40:
-            warn("单卡显存 < 40GB，1.7B 全参微调需约 27GB + 激活，可能偏紧")
+        if total / 2**30 < 32:
+            warn("单卡显存 < 32GB，1.7B 全参微调需约 21GB + 激活，可能偏紧")
     except Exception:
         warn("mem_get_info 不可用，跳过显存检查")
     return True
@@ -261,8 +261,9 @@ def s4_codes(model_path, workdir, real_jsonl=None):
     for r in rows:
         try:
             c = tok.encode(r["audio"])
-            c = c[0] if isinstance(c, (list, tuple)) else c
-            r["audio_codes"] = c.tolist() if hasattr(c, "tolist") else c
+            # encode 返回 Qwen3TTSTokenizerV2EncoderOutput（ModelOutput），
+            # audio_codes 是 List[Tensor]，取 batch 第 0 条转 list
+            r["audio_codes"] = c.audio_codes[0].cpu().tolist()
             done.append(r)
         except Exception as e:
             return fail(f"encode 失败: {type(e).__name__}: {e}",
@@ -462,36 +463,51 @@ def main():
 
     state = {"codes": args.codes_jsonl, "ckpt_root": None, "ckpt": None}
     failed = []
+    ran = set()
     try:
-        if 0 in want and not s0_env():
-            failed.append(0)
-            raise SystemExit
-        if 1 in want and not s1_ops():
-            failed.append(1)
-        if 2 in want and not s2_attn(args.model_path):
-            failed.append(2)
-        if 3 in want and not s3_load(args.model_path, args.attn):
-            failed.append(3)
-            raise SystemExit
-        if 4 in want and not args.codes_jsonl:
-            state["codes"] = s4_codes(args.model_path, wd, args.real_jsonl)
-            if not state["codes"]:
-                failed.append(4)
+        if 0 in want:
+            ran.add(0)
+            if not s0_env():
+                failed.append(0)
                 raise SystemExit
+        if 1 in want:
+            ran.add(1)
+            if not s1_ops():
+                failed.append(1)
+        if 2 in want:
+            ran.add(2)
+            if not s2_attn(args.model_path):
+                failed.append(2)
+        if 3 in want:
+            ran.add(3)
+            if not s3_load(args.model_path, args.attn):
+                failed.append(3)
+                raise SystemExit
+        if 4 in want:
+            ran.add(4)   # 给了 --codes_jsonl 也视为已满足（用户自带产物）
+            if not args.codes_jsonl:
+                state["codes"] = s4_codes(args.model_path, wd, args.real_jsonl)
+                if not state["codes"]:
+                    failed.append(4)
+                    raise SystemExit
         if 5 in want and state["codes"]:
+            ran.add(5)
             if not s5_layout(args.model_path, state["codes"], args.language):
                 failed.append(5)
         if 6 in want and state["codes"]:
+            ran.add(6)
             state["ckpt_root"] = s6_train(args.model_path, state["codes"], wd,
                                           args.attn, args.language, args.steps)
             if not state["ckpt_root"]:
                 failed.append(6)
                 raise SystemExit
         if 7 in want and state["ckpt_root"]:
+            ran.add(7)
             state["ckpt"] = s7_ckpt(state["ckpt_root"])
             if not state["ckpt"]:
                 failed.append(7)
         if 8 in want and state["ckpt"]:
+            ran.add(8)
             if not s8_infer(state["ckpt"], args.attn, wd):
                 failed.append(8)
     except SystemExit:
@@ -502,14 +518,20 @@ def main():
             log(f"  {line}")
         failed.append(-1)
 
+    # 请求了但因缺前置产物被静默跳过的阶段：必须显式报出来，
+    # 否则「失败阶段: 无 —— 全部通过 ✅」可能意味着一步都没跑
+    skipped = sorted(want - ran)
     log(f"\n{'=' * 66}")
     log("失败阶段: " + (", ".join(map(str, failed)) if failed else "无 —— 全部通过 ✅"))
+    if skipped:
+        log(f"⚠️  请求但未执行的阶段: {skipped}"
+            f"（缺前置产物：5/6 需要 --codes_jsonl 或先跑阶段 4，7/8 需要先跑 6）")
     log(f"产物在 {wd}")
     log("=" * 66)
     with open(args.report, "w", encoding="utf-8") as f:
         f.write("\n".join(REPORT) + "\n")
     print(f"\n报告已写入 {args.report}（把它贴回来即可定位问题）")
-    sys.exit(1 if failed else 0)
+    sys.exit(1 if (failed or skipped) else 0)
 
 
 if __name__ == "__main__":
