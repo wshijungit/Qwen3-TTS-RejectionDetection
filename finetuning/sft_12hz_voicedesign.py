@@ -86,14 +86,22 @@ def train():
     parser.add_argument("--attn", type=str, default="sdpa",
                         help="CUDA 上可传 flash_attention_2；NPU 上不可用，保持 sdpa/eager")
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument(
+        "--dtype", choices=["bf16", "fp32"], default="fp32",
+        help="权重精度。bf16 = 参数/梯度/Adam 动量全 bf16（实测 accelerate 的 "
+             "mixed_precision 不额外保留 fp32 主权重），1.7B 静态仅约 12.7GiB，"
+             "但 exp_avg_sq 用 8 位尾数累积梯度平方，lr 2e-5 下更新量有下溢风险；"
+             "fp32 = 标准混合精度（fp32 权重 + autocast bf16 计算），约 27GiB，"
+             "910B2 的 64GB 完全吃得下，收敛更稳。显存不紧就用 fp32")
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum,
                               mixed_precision="bf16")
 
     MODEL_PATH = args.init_model_path
+    load_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     qwen3tts = Qwen3TTSModel.from_pretrained(
-        MODEL_PATH, torch_dtype=torch.bfloat16, attn_implementation=args.attn,
+        MODEL_PATH, torch_dtype=load_dtype, attn_implementation=args.attn,
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 

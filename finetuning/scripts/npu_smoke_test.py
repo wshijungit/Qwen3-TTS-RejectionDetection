@@ -132,7 +132,8 @@ def s1_ops():
         free, total = torch.npu.mem_get_info(0)
         ok(f"显存 {free / 2**30:.1f} / {total / 2**30:.1f} GiB 可用")
         if total / 2**30 < 32:
-            warn("单卡显存 < 32GB，1.7B 全参微调需约 21GB + 激活，可能偏紧")
+            warn("单卡显存 < 32GB：--dtype fp32 需约 27GiB + 激活，可能偏紧；"
+                 "可改 --dtype bf16（约 12.7GiB），但 Adam 动量也会是 bf16，注意收敛")
     except Exception:
         warn("mem_get_info 不可用，跳过显存检查")
     return True
@@ -333,7 +334,7 @@ def s5_layout(model_path, codes_jsonl, language):
 # ---------------------------------------------------------------- 6 前反向
 
 
-def s6_train(model_path, codes_jsonl, workdir, attn, language, steps):
+def s6_train(model_path, codes_jsonl, workdir, attn, language, steps, dtype="fp32"):
     stage(6, f"前反向（{steps} 步，看 loss 是否真的在降）")
     ft = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out = os.path.join(workdir, "ckpt")
@@ -341,7 +342,7 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps):
            f"--init_model_path {model_path} --train_jsonl {codes_jsonl} "
            f"--output_model_path {out} --batch_size 1 --grad_accum 1 "
            f"--num_epochs 1 --max_steps {steps} --log_every 1 "
-           f"--attn {attn} --language {language} 2>&1")
+           f"--attn {attn} --language {language} --dtype {dtype} 2>&1")
     log(f"  $ {cmd}\n")
     import subprocess
 
@@ -365,7 +366,8 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps):
         return fail("没解析到 loss", "训练可能没真正开始")
     ok(f"loss {losses[0]:.4f} → {losses[-1]:.4f}（{len(losses)} 步）")
     if losses[-1] >= losses[0]:
-        warn("loss 没下降。步数太少时正常；若几百步仍不降，怀疑 bf16 无 fp32 主权重导致更新下溢")
+        warn("loss 没下降。步数太少时正常；若几百步仍不降且用的是 --dtype bf16，"
+             "换 --dtype fp32 再试（bf16 下 Adam 动量也是 bf16，更新易下溢）")
     return out
 
 
@@ -441,6 +443,7 @@ def main():
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument("--language", default="Chinese")
     ap.add_argument("--steps", type=int, default=6)
+    ap.add_argument("--dtype", choices=["bf16", "fp32"], default="fp32")
     ap.add_argument("--real_jsonl", default=None, help="用真实数据（含 audio/text/instruct）")
     ap.add_argument("--codes_jsonl", default=None,
                     help="已抽好 audio_codes 的 jsonl，给定则跳过阶段 4。"
@@ -497,7 +500,7 @@ def main():
         if 6 in want and state["codes"]:
             ran.add(6)
             state["ckpt_root"] = s6_train(args.model_path, state["codes"], wd,
-                                          args.attn, args.language, args.steps)
+                                          args.attn, args.language, args.steps, args.dtype)
             if not state["ckpt_root"]:
                 failed.append(6)
                 raise SystemExit

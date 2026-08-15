@@ -1,8 +1,8 @@
 #!/bin/bash
 # V2 VoiceDesign 微调 —— 本机 debug 版（单卡 910B2 / 64GB）。
 #
-# 1.7B 全参微调静态显存约 21GB（bf16 参数 3.4 + 梯度 3.4 + Adam m/v fp32 13.6；
-# accelerate 的 bf16 混合精度不保留 fp32 主权重），64GB 单卡装得下 ——
+# 1.7B 全参微调静态显存：--dtype fp32（默认）约 27GiB，--dtype bf16 约 12.7GiB
+# （实测 accelerate 的 bf16 下参数/梯度/Adam 动量全是 bf16）。64GB 单卡装得下 ——
 # **不需要任何分布式**，直接 python 起，
 # 不用 torchrun、不用 FSDP、不用 MindSpeed。
 #

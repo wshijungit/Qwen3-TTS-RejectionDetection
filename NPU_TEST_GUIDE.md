@@ -25,7 +25,23 @@ python npu_smoke_test.py --model_path /path/to/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 |---|---|---|---|
 | 1 | `sdpa` 在 torch_npu 2.1.0 上的覆盖度 | 开发机无 NPU。可能可用、可能静默退化到 math 分支（能跑但慢且费显存） | 阶段 2 |
 | 2 | `accelerate 1.0.0` 够不够用 | `pyproject` 钉 1.12.0（要 py≥3.10），而昇腾现役 conda 是 **py3.9**，只能装 1.0.0 | 阶段 0 |
-| 3 | bf16 无 fp32 主权重时能否收敛 | 需要几百步才看得出来 | 阶段 6（只能看趋势） |
+| 3 | bf16 下能否收敛 | 需要几百步才看得出来 | 阶段 6（只能看趋势） |
+
+关于 #3，**开发机上已实测出更确切的结论**（`--dtype bf16` 时）：
+
+```
+参数 dtype / 梯度 dtype        : bfloat16
+exp_avg (m) / exp_avg_sq (v)   : bfloat16      <- Adam 两个动量也是 bf16
+有 fp32 主权重吗               : False
+-> 1.7B 静态约 12.7 GiB
+```
+
+不只是没有 fp32 主权重，**Adam 动量本身也是 bf16**。`exp_avg_sq` 用 8 位尾数
+累积梯度平方，lr 2e-5 下更新量下溢的风险比原先判断的大。
+
+**因此 `--dtype` 默认已改为 `fp32`**（标准混合精度：fp32 权重 + autocast bf16 计算，
+约 27GiB）。910B2 是 64GB，完全吃得下，没有理由为省显存冒收敛风险。
+显存真紧再传 `--dtype bf16`。
 
 另有一个已知必踩项：**`transformers` 在那台机器上没装**（`NPU_ENV.md §2` 确认）。
 `pyproject` 要求 4.57.3，其 `requires-python >=3.9.0`，py3.9 可以装。
@@ -110,10 +126,15 @@ MODEL_PATH=/path/VoiceDesign RAW_JSONL=./data_v2/train_raw.jsonl \
 bash run_v2_npu_cluster.sh
 ```
 
-**1.7B 全参微调单卡就够**：静态显存约 21GB（bf16 参数 3.4 + 梯度 3.4 +
-Adam m/v fp32 13.6；accelerate 的 bf16 混合精度**不保留** fp32 主权重——
-这也正是 §1 未知项 #3 的由来），910B2 是 64GB。集群多卡只为吞吐，走
-accelerate 原生 DDP，**不需要 FSDP / ZeRO / MindSpeed**。
+**1.7B 全参微调单卡就够**，两种精度实测（开发机 H200，均跑通并落盘）：
+
+| `--dtype` | 参数/梯度/m/v | 静态显存 | 说明 |
+|---|---|---|---|
+| `fp32`（**默认**） | fp32 | 约 27 GiB | 标准混合精度，收敛更稳 |
+| `bf16` | 全 bf16 | 约 12.7 GiB | 省显存，但 Adam 动量也是 bf16，有下溢风险 |
+
+910B2 是 64GB，默认的 fp32 完全吃得下。集群多卡只为吞吐，走 accelerate 原生
+DDP，**不需要 FSDP / ZeRO / MindSpeed**。
 
 > MindSpeed 的价值在模型并行。原本 MiMo-Audio 7B 那条线要 128GB、单卡放不下，
 > 才有移植的必要；换成 1.7B 后这个前提没了。
