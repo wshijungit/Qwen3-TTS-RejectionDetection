@@ -529,6 +529,75 @@ loss 从 3.6 降到 1.1，**确认在真降不是抖**——bf16 之外的收敛
      全量 trimmed wav 约 50-60GB）。
 
 
+## 11. 接真实数据（下一步）
+
+冒烟与收敛都过了，接下来把真实拒识数据接进管线。**分三步，每步验完再往下。**
+
+三个数据集现在都有抽取好的扁平 wav 池（§10.6 实测），正是
+`prepare_v2_data.py` 期望的 `<wav_dir>/<uttid>.wav` 形式，直接可用。
+
+### 11.1 先 100 条 sanity check
+
+```bash
+D=/opt/huawei/dataset/duplex_whj_data
+cd finetuning
+
+python prepare_v2_data.py \
+  --dataset cc0601 $D/CC_new_0601_0630.jsonl      $D/CC_new_0601_0630_wavs \
+  --dataset cc0701 $D/CC_new_0701_0730.jsonl      $D/CC_new_0701_0730_wavs \
+  --dataset car05  $D/car_all_0415_0424.jsonl     $D/car_all_0415_0424_wavs \
+  --out-dir ./data_v2_smoke --wav-out-dir /tmp/v2_wav_smoke \
+  --limit 100 --workers 16 --val-size 10
+```
+
+（jsonl 的确切文件名以实际为准，上面按 §10.6 的命名写。）
+
+**要看的（脚本会自己打印）**：
+
+| 项 | 关注什么 |
+|---|---|
+| 各数据集 kept / 各类丢弃数 | `wav_not_found` 应为 0（池子命中 100%） |
+| 一致性筛选前后 reject 占比 | 预期从约 29/35/49% 降 5-6 个百分点 |
+| VAD 前后时长、切掉比例 | 切太多说明 `--top-db` 偏激进 |
+| **类别偏斜告警** | 有 ⚠️ 就停下，别全量跑 |
+
+再抽几条 `train_raw.jsonl` 看 instruct 转写通不通顺——**这是第一次在真实
+gemini 数据上跑转写**，之前都是合成样本。
+
+### 11.2 小批量真实数据训一次
+
+```bash
+head -256 data_v2_smoke/train_raw.jsonl > /tmp/real256.jsonl
+python prepare_data.py --device npu:0 \
+  --tokenizer_model_path <VoiceDesign>/speech_tokenizer \
+  --input_jsonl /tmp/real256.jsonl --output_jsonl /tmp/real256_codes.jsonl
+
+cd scripts
+python npu_smoke_test.py --model_path <VoiceDesign> \
+  --codes_jsonl /tmp/real256_codes.jsonl --stages 5-8 --steps 200
+```
+
+真实数据的 instruct 比合成的长得多（gemini 的 evidence + reason 几十字），
+**序列会长不少**——阶段 5 的布局断言和显存都要重新确认。
+
+顺带这一步也是 **9.4 的正式版**：真实数据下再比一次 `--attn sdpa` / `eager`。
+
+### 11.3 定规模后再全量
+
+由 11.2 的单步耗时和显存反推 batch size，填 §9.6 的表。
+
+**注意**：按合成数据的 1.0s/step、batch=1 估，43.5w 条 1 epoch 约 121 小时。
+显存还有大余量（fp32 只用 25GiB / 61GiB），**batch 必须提上去**，
+否则时间不可接受。这是 11.3 要解决的主要问题。
+
+全量数据准备本身：
+```bash
+python prepare_v2_data.py --dataset ... --out-dir ./data_v2 \
+  --wav-out-dir /path/big_disk --workers 32 --skip-existing
+```
+VAD 预计数小时，trimmed wav 约 50-60GB，`--skip-existing` 可断点续跑。
+
+
 ## 附：已知会失败的地方（已在代码里处理，列出来备查）
 
 | 项 | 处理 |
