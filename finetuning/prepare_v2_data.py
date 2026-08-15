@@ -91,6 +91,11 @@ PUNCT = "。；;，,、 \t\r\n"
 # 只统计不丢弃 —— 音频预处理只做 VAD，不加别的过滤。
 SUSPICIOUS_KEEP = 0.25
 
+# 帧间 dB 动态范围低于此值 → 整段没有说话/静音的起伏，疑似纯底噪或数字静音。
+# energy VAD 的阈值是相对本文件的，原理上判不出"整段没人声"（见 trim_silence
+# 文档），故用这个量出证据。同样只统计不丢弃。
+SUSPICIOUS_DB_RANGE = 6.0
+
 # energy VAD 的 dB 参考分位。100 = 用最大帧作参考，与 librosa.effects.trim 一致，
 # 是默认行为。已知的失效模式：**任何强瞬态**（关门、喇叭、碰麦…）会把参考值抬高，
 # 使真正的人声整体落到 (ref - top_db) 之下被当静音掐掉——合成信号实测，
@@ -173,18 +178,27 @@ def _get_silero(model_path):
 def trim_silence(wav, sr, mode, top_db, silero_path, ref_percentile=None):
     """
     只切首尾静音，不动句中停顿——句中停顿是腔调的一部分。
-    返回 (trimmed_wav, 是否检测到人声)
+
+    返回 (trimmed_wav, 是否检测到人声, info)。info 里带诊断量，只用于出报告，
+    **不参与任何丢弃决策**（音频预处理只做 VAD）。
+
+    注意 energy 模式下 `has_speech` 恒为 True：阈值是相对本文件自身的
+    （ref - top_db），峰值帧必然过阈，`idx` 不可能为空。也就是说这个模式
+    **在原理上无法判断"整段没人声"**。纯底噪/纯数字静音的文件会原样保留、
+    并被判为有人声。为此 info 里给出 `db_range`（帧间 dB 动态范围）：
+    有人声的录音必然有说话/静音的起伏，动态范围极小就说明整段没内容。
+    该量只进报告的疑似清单供抽听，不据此丢样本。
     """
     if mode == "none":
-        return wav, True
+        return wav, True, {}
 
     if mode == "silero":
         S = _get_silero(silero_path)
         torch = S["torch"]
         ts = S["get_ts"](torch.from_numpy(wav), S["m"], sampling_rate=sr)
         if not ts:
-            return wav[:0], False
-        return wav[ts[0]["start"] : ts[-1]["end"]], True
+            return wav[:0], False, {}
+        return wav[ts[0]["start"] : ts[-1]["end"]], True, {}
 
     # energy（默认）：纯 numpy 实现，**不要换回 librosa**。
     # 实测本机 aarch64 上「import soundfile（加载 libsndfile .so）+ numba JIT
@@ -200,7 +214,10 @@ def trim_silence(wav, sr, mode, top_db, silero_path, ref_percentile=None):
     #   ② 参考值分位可调（默认 100 = max，与 librosa 相同）。
     FRAME, HOP = 2048, 512
     if wav.size < FRAME:
-        return wav[:0], False
+        # 短于一帧（2048 样点 = 16kHz 下 0.128s）无法分帧。librosa 会原样返回，
+        # 这里判为无人声。默认 --min-dur 0.3 下两者无差别（0.128 < 0.3），
+        # 只有把 min-dur 调到 0.128 以下、或源采样率高于 16k 时行为才分叉。
+        return wav[:0], False, {}
     n = 1 + (wav.size - FRAME) // HOP
     frames = np.lib.stride_tricks.as_strided(
         wav,
@@ -219,11 +236,12 @@ def trim_silence(wav, sr, mode, top_db, silero_path, ref_percentile=None):
     db = 20.0 * np.log10(np.maximum(rms, 1e-10))
     ref_db = float(np.percentile(db, ref_percentile or REF_PERCENTILE)) - top_db
     idx = np.nonzero(db > ref_db)[0]
+    info = {"db_range": float(db.max() - db.min())}
     if idx.size == 0:
-        return wav[:0], False
+        return wav[:0], False, info
     start = int(idx[0]) * HOP
     end = min(wav.size, (int(idx[-1]) + 1) * HOP + FRAME)
-    return wav[start:end], True
+    return wav[start:end], True, info
 
 
 # ---------------------------------------------------------------- 单条处理（子进程）
@@ -251,6 +269,7 @@ def process_one(job):
 
     dur_before = None
     dur_after = None
+    vad_info = {}
 
     # 断点续跑：已有产物则复用（VAD 参数指纹已在父进程校验过一致）
     if cfg["skip_existing"] and os.path.isfile(dst):
@@ -277,7 +296,7 @@ def process_one(job):
         dur_before = len(wav) / sr
 
         try:
-            wav, has_speech = trim_silence(
+            wav, has_speech, vad_info = trim_silence(
                 wav, sr, cfg["vad"], cfg["top_db"], cfg["silero_path"],
                 cfg.get("ref_percentile"),
             )
@@ -306,6 +325,7 @@ def process_one(job):
     rec["_wav"] = dst
     rec["_dur_before"] = dur_before
     rec["_dur_after"] = dur_after
+    rec["_db_range"] = vad_info.get("db_range")
     return {"status": "ok", "uttid": uttid, "label": label, "rec": rec}
 
 
@@ -712,10 +732,18 @@ def main():
                         if rec["_dur_before"] > 0:
                             keep = rec["_dur_after"] / rec["_dur_before"]
                             stats["ratios"].append(keep)
+                            dbr = rec.get("_db_range")
+                            why = []
                             if keep < SUSPICIOUS_KEEP:
+                                why.append("过切")
+                            if dbr is not None and dbr < SUSPICIOUS_DB_RANGE:
+                                why.append("无动态")
+                            if why:
                                 stats["suspicious"].append(
                                     (rec["uttid"], round(rec["_dur_before"], 2),
-                                     round(rec["_dur_after"], 2), rec["label"]))
+                                     round(rec["_dur_after"], 2), rec["label"],
+                                     None if dbr is None else round(dbr, 1),
+                                     "+".join(why)))
             except Exception as e:
                 tail = chunk[chunk_done:]
                 stats["worker_crash"] += len(tail)
@@ -774,17 +802,17 @@ def main():
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
 
     # 疑似过切清单：按保留比例升序，最可疑的排最前，直接拿去抽听
-    susp = [(ds, *t) for ds, st_ in per_ds_stats.items() for t in st_["suspicious"]
-            for ds in (ds,)]
+    susp = [(ds, *t) for ds, st_ in per_ds_stats.items() for t in st_["suspicious"]]
     if susp:
-        susp.sort(key=lambda r: r[3] / max(r[2], 1e-9))
+        susp.sort(key=lambda r: r[3] / max(r[2], 1e-9))   # 保留比例升序，最可疑在前
         with open(os.path.join(args.out_dir, "suspicious_vad.jsonl"), "w",
                   encoding="utf-8") as f:
-            for ds, uttid, before, after, label in susp:
+            for ds, uttid, before, after, label, dbr, why in susp:
                 f.write(json.dumps(
                     {"dataset": ds, "uttid": uttid, "dur_before": before,
                      "dur_after": after, "keep": round(after / max(before, 1e-9), 3),
-                     "label": label}, ensure_ascii=False) + "\n")
+                     "db_range": dbr, "why": why, "label": label},
+                    ensure_ascii=False) + "\n")
 
     # ---------------- 统计报告 ----------------
     cfg_dump = dict(vars(args))
@@ -867,12 +895,23 @@ def main():
                 f"p25 {q[2]:.2f} | p50 {q[3]:.2f}"
             )
             if s["suspicious"]:
-                by = Counter(lb for *_, lb in s["suspicious"])
+                by = Counter(r[3] for r in s["suspicious"])
+                cut = sum(1 for r in s["suspicious"] if "过切" in r[5])
+                flat = sum(1 for r in s["suspicious"] if "无动态" in r[5])
                 lines.append(
-                    f"  ⚠ 疑似过切（保留 < {SUSPICIOUS_KEEP:.0%}）{len(s['suspicious']):,} 条"
-                    f"（accept {by[0]:,} / reject {by[1]:,}），已写入 suspicious_vad.jsonl；"
-                    f"抽听几条确认是不是强瞬态锁死了参考值，是就把 --ref-percentile 调到 95"
+                    f"  ⚠ 疑似样本 {len(s['suspicious']):,} 条"
+                    f"（accept {by[0]:,} / reject {by[1]:,}）→ suspicious_vad.jsonl"
                 )
+                if cut:
+                    lines.append(
+                        f"      过切 {cut:,} 条（保留 < {SUSPICIOUS_KEEP:.0%}）——"
+                        f"抽听确认是否强瞬态锁死了参考值，是则把 --ref-percentile 调到 95"
+                    )
+                if flat:
+                    lines.append(
+                        f"      无动态 {flat:,} 条（dB 动态范围 < {SUSPICIOUS_DB_RANGE:.0f}）——"
+                        f"疑似纯底噪/数字静音，energy VAD 原理上判不出，需抽听"
+                    )
         if db and d.get("trimmed_ratio") is not None:
             lines.append(
                 f"  时长 VAD 前/后  {d['dur_before_mean']}s → {d['dur_after_mean']}s"

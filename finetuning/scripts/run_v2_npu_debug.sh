@@ -31,15 +31,19 @@ fi
 DEVICE=${DEVICE:-npu:0}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0}
 
-# 路径约定对齐参考仓库（duplex_huanyu_qwen35 与 MiMo v2 脚本）：
-#   模型  /home/ma-user/work/model/...                        （集群 /opt/huawei/quoteModel）
-#   数据  /home/ma-user/work/dataset/duplex_whj_data/v2/...   （集群 /opt/huawei/dataset）
-#   输出  /home/ma-user/work/quoteModel/duplex_whj_exp/...    （集群 /opt/huawei/quoteModel）
-MODEL_PATH=${MODEL_PATH:-/home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign}
+# 路径约定对齐参考仓库（duplex_huanyu_qwen35 与 MiMo v2 脚本）。
+# 调试机与集群同构，只差前缀，故收敛成 WORK_ROOT 一个开关：
+#   调试机  WORK_ROOT=/home/ma-user/work     （默认）
+#   集群    WORK_ROOT=/opt/huawei
+#   模型 $WORK_ROOT/model|quoteModel · 数据 $WORK_ROOT/dataset · 输出 $WORK_ROOT/quoteModel
+WORK_ROOT=${WORK_ROOT:-/home/ma-user/work}
+DATA_ROOT=${DATA_ROOT:-$WORK_ROOT/dataset/duplex_whj_data/v2}
+
+MODEL_PATH=${MODEL_PATH:-$WORK_ROOT/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign}
 TOKENIZER_PATH=${TOKENIZER_PATH:-${MODEL_PATH}/speech_tokenizer}
-RAW_JSONL=$(realpath -m "${RAW_JSONL:-/home/ma-user/work/dataset/duplex_whj_data/v2/train_raw.jsonl}")
-TRAIN_JSONL=$(realpath -m "${TRAIN_JSONL:-/home/ma-user/work/dataset/duplex_whj_data/v2/train_codes.jsonl}")
-OUTPUT_DIR=$(realpath -m "${OUTPUT_DIR:-/home/ma-user/work/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/debug}")
+RAW_JSONL=$(realpath -m "${RAW_JSONL:-$DATA_ROOT/train_raw.jsonl}")
+TRAIN_JSONL=$(realpath -m "${TRAIN_JSONL:-$DATA_ROOT/train_codes.jsonl}")
+OUTPUT_DIR=$(realpath -m "${OUTPUT_DIR:-$WORK_ROOT/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/debug}")
 
 BATCH_SIZE=${BATCH_SIZE:-2}
 GRAD_ACCUM=${GRAD_ACCUM:-4}
@@ -72,6 +76,10 @@ npu_preflight "$PY"
 for p in "$MODEL_PATH" "$TOKENIZER_PATH"; do
     [ -e "$p" ] || { echo "❌ 路径不存在: $p" >&2; exit 1; }
 done
+# SKIP_PREPARE=1 时不会生成 TRAIN_JSONL，得先确认它在
+if [ "${SKIP_PREPARE:-0}" = "1" ] && [ ! -f "$TRAIN_JSONL" ]; then
+    echo "❌ SKIP_PREPARE=1 但训练数据不存在: $TRAIN_JSONL" >&2; exit 1
+fi
 
 cd "$FT_DIR"
 
