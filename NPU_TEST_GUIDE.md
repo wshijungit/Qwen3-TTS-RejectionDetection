@@ -1240,6 +1240,11 @@ python npu_smoke_test.py   --model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-
 **差 10 倍**。核数不同结论可能不同，以你那边的输出为准。
 若最优值 ≠ 代码默认的 4 且差距 >0.2h，冒烟会直接 ⚠️ 提示设多少。
 
+**2026-08-16 NPU 回填**：最优 = **4**（15.3 ms/条 → 1.8h；不设 17.5 ms/条 → 2.1h）。
+⚠️ **注意这两个数只含 encoder 前向**——真实 `--spk-only` 管线实测
+（含 librosa.load / SFS 读 / 16k→24k 重采样）是 **66.3 ms/条 → 全量约 8h**，
+不是 1.8h。线程数在本机影响小（最优 vs 不设只差 13%），照抄 4 即可。
+
 #### (2) 确认 `--spk_model_path` 指的是 1.7B-Base
 
 ```bash
@@ -1324,6 +1329,13 @@ cd scripts && python npu_smoke_test.py --model_path $MDL   --codes_jsonl /tmp/re
 阶段 8 时长差 34.6%。带 spk 后**看两件事**：loss 是否仍降到同一量级（明显更差
 说明那一格在干扰而不是帮忙），以及阶段 8 的时长差是否还在（掉到个位数说明
 spk 把 instruct 的控制力压掉了 —— 那正是 ref==target 最担心的 shortcut）。
+
+**2026-08-16 NPU 小批量验回填**：带 spk 200 步（同配置，重建的 256 条）——
+loss 前/后 20 步均值 **3.8949 → 3.8979**（与基线尾段 ~4.0 同量级，无干扰迹象；
+但单 epoch 每条只见一次，loss 趋势本就不是有效判据，更硬的验证要固定小样本
+多 epoch）；阶段 8 时长差 **29.8%**（对机 6.80s / 对人 9.68s），仍两位数，
+**spk 没有压掉 instruct 的控制力**。两个判据都过，报告
+`npu_smoke_report_real256_spk.txt` 随提交。
 
 **开跑前先确认这一条**（开发机无法验证，是本轮唯一的存疑项）：
 
@@ -1514,3 +1526,22 @@ pull 到这版后请把答案直接写在本节下面：
 4. **`$S` 前缀存在且正确**：
    `ls /home/ma-user/work/dataset/stc_data/dataset/cabin_duplex_data_artif/yibuapi_outputs/`
    下三个 jsonl 都在（§11.1/§11.2 实测即用此路径，无歧义）。
+
+### 十二轮（NPU 侧）：spk 全链路小批量验 + §16.2 三步完成（2026-08-16）
+
+1. §16.2(1)：重跑 spk 冒烟（npu_smoke_report_spk2.txt）全过，SPK_MEL_THREADS
+   自动扫描在昇腾上工作正常，本机最优 **4**（15.3 ms/条；不设 17.5 ms/条，
+   差距仅 13%，与开发机「差 10 倍」完全不同）
+2. §16.2(3) + §16.1 第 4 步小批量验：256 条真实 VAD-trimmed 数据
+   spk-only 抽取实测 **66.3 ms/条**（含 load/重采样/SFS 读，全量约 **8h**，
+   修正文档里基于内存基准的 1.8h）→ smoke 5-8 全过：阶段 5 十四项 PASS、
+   200 步 loss 均值 3.89→3.90（与基线同量级）、阶段 8 时长差 29.8%（spk 没压掉
+   instruct）。两个判据都过
+3. 启动脚本 SPK_FILE/SPK_MODEL_PATH 默认值按用户指定落位：
+   `~/work/dataset/wsj-mimo-data/qwen3_spk_emb/spk.f16`（debug）与
+   `${WORK_ROOT}/dataset/wsj-mimo-data/qwen3_spk_emb/spk.f16`（集群）
+4. 两条环境教训：① /tmp 清理把旧小批量数据的 trimmed wav 删了导致 spk 抽取
+   全崩——小批量数据已重建到 **SFS**（`wsj-mimo-data/v2_smoke_data` +
+   `v2_smoke_wav`），以后中间产物一律不放 /tmp；② 0 字节 spk 文件会让冒烟
+   阶段静默跳过且报告仍打「全部通过」——疑似新代码在 spk 校验处 SystemExit
+   被 except 吞掉，待查（复现条件：给不存在的 spk 路径/空文件）

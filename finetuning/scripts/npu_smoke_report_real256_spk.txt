@@ -1,0 +1,80 @@
+工作目录 /tmp/npu_smoke_d3hrzmeq
+模型 /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+阶段 [5, 6, 7, 8]
+
+==================================================================
+[阶段 5] 序列布局（与推理侧逐格核对，纯 CPU）｜含 speaker 槽位
+==================================================================
+  ✅ codec_bos 与 tts_eos 分处两格: PASS
+  ✅ tts_eos 那格 codec = codec_pad: PASS
+  ✅ codec_bos 那格 text = tts_pad: PASS
+  ✅ label 起点 = codec_bos 位: PASS
+  ✅ label 末位 = codec_eos: PASS
+  ✅ 对齐块 codec 前缀逐格相符（block 宽 6，think 开头）: PASS
+  ✅ instruct 段 codec_embedding_mask 为 False: PASS
+  ✅ 带 spk 的块宽 = 6（比不带 spk 多一格）: PASS
+  ✅ spk 槽位夹在 think_eos 与 codec_pad 之间（与推理侧 cat(emb0, spk, emb1) 一致）: PASS
+  ✅ spk_pos 指到对齐块内的 spk 格: PASS
+  ✅ spk 那格 codec_embedding_mask 为 True: PASS
+  ✅ 两条 instruct 不等长时 spk_pos 各不相同: PASS
+  ✅ spk_vec 与源文件逐位相同（没在 collate 里被打乱）: PASS
+  ✅ spk 向量非全零（抽取环节没静默失败）: PASS
+
+==================================================================
+[阶段 6] 前反向（200 步，batch=1，bucket=64，含 spk）
+==================================================================
+  $ cd /home/ma-user/work/dataset/wsj-mimo-data/Qwen3-TTS-RejectionDetection/finetuning && /home/ma-user/anaconda3/envs/PyTorch-2.1.0/bin/python sft_12hz_voicedesign.py --init_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign --train_jsonl /tmp/real256b_codes.jsonl --output_model_path /tmp/npu_smoke_d3hrzmeq/ckpt --batch_size 1 --grad_accum 1 --num_epochs 1 --max_steps 200 --log_every 1 --attn sdpa --language Chinese --dtype fp32 --length-bucket 64 --save-every 0 --spk-file /tmp/real256b_spk.f16 2>&1
+
+  | Epoch 0 | Step 177 | Loss: 3.8106
+  | Epoch 0 | Step 178 | Loss: 4.1442
+  | Epoch 0 | Step 179 | Loss: 3.3910
+  | Epoch 0 | Step 180 | Loss: 3.5149
+  | Epoch 0 | Step 181 | Loss: 3.4225
+  | Epoch 0 | Step 182 | Loss: 4.3792
+  | Epoch 0 | Step 183 | Loss: 3.4455
+  | Epoch 0 | Step 184 | Loss: 4.3201
+  | Epoch 0 | Step 185 | Loss: 3.4616
+  | Epoch 0 | Step 186 | Loss: 3.2590
+  | Epoch 0 | Step 187 | Loss: 4.7906
+  | Epoch 0 | Step 188 | Loss: 4.4439
+  | Epoch 0 | Step 189 | Loss: 3.4135
+  | Epoch 0 | Step 190 | Loss: 3.7938
+  | Epoch 0 | Step 191 | Loss: 4.3566
+  | Epoch 0 | Step 192 | Loss: 3.6666
+  | Epoch 0 | Step 193 | Loss: 3.8615
+  | Epoch 0 | Step 194 | Loss: 3.6025
+  | Epoch 0 | Step 195 | Loss: 4.7249
+  | Epoch 0 | Step 196 | Loss: 4.3413
+  | Epoch 0 | Step 197 | Loss: 3.8990
+  | Epoch 0 | Step 198 | Loss: 3.4980
+  | Epoch 0 | Step 199 | Loss: 3.7637
+  | 到达 --max_steps 200，提前结束
+  | 已保存 /tmp/npu_smoke_d3hrzmeq/ckpt/checkpoint-epoch-0
+  ✅ loss 前 20 步均值 3.8949 → 后 20 步均值 3.8979（共 200 步；首末单点 2.9159/3.7637 仅供参考，单样本噪声大）
+  ✅ batch=1 → 1.10 样本/秒（实跑 200 步，含加载/编译摊销）
+  ✅ 训练总耗时 182.5s（含加载/编译），约 0.9s/step
+  ⚠️  loss 均值没下降。注意 batch=1 且样本数 < 步数时，一个 epoch 内每条只见一次，本就不该有可见收敛——要看收敛请固定小样本集跑多个 epoch。若几百步仍不降且用的是 --dtype bf16，换 --dtype fp32 再试（bf16 下 Adam 动量也是 bf16，更新易下溢）
+
+==================================================================
+[阶段 7] checkpoint 完整性
+==================================================================
+  ✅ config.json + 顶层 model.safetensors + speech_tokenizer/model.safetensors 都在
+  ✅ 无残留 index.json
+  ✅ tts_model_type = voice_design, v2_train_language = Chinese
+
+==================================================================
+[阶段 8] 推理（验证 instruct 通路仍生效）
+==================================================================
+  language=Chinese（必须与训练一致，否则 codec 前缀块宽不同 = 静默失配）
+  ✅ speech_tokenizer 已在 npu:0（decode 不会退回 CPU）
+  ✅ 微调后的 ckpt 可加载
+  ✅ 对机腔 生成成功 6.80s → /tmp/npu_smoke_d3hrzmeq/infer_对机.wav
+  ✅ 对人腔 生成成功 9.68s → /tmp/npu_smoke_d3hrzmeq/infer_对人.wav
+
+  同一句文本、两条 instruct 的时长差 = 29.8%
+  ✅ 时长有明显差异，instruct 通路在起作用（腔调对不对仍需听辨）
+
+==================================================================
+失败阶段: 无 —— 全部通过 ✅
+产物在 /tmp/npu_smoke_d3hrzmeq
+==================================================================

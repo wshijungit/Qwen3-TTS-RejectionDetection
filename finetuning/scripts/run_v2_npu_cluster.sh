@@ -63,7 +63,7 @@ EPOCHS=${EPOCHS:-1}
 LR=${LR:-2e-5}
 LANGUAGE=${LANGUAGE:-Chinese}
 ATTN=${ATTN:-sdpa}
-# fp32（默认）约 25GiB / bf16 约 12.7GiB，910B2 是 64GB，默认走 fp32 更稳
+# fp32（默认）约 25GiB / bf16 约 12.7GiB，910B1 是 64GB，默认走 fp32 更稳
 DTYPE=${DTYPE:-fp32}
 # 每 N 步存一次。全量 1 epoch 是十几小时，只在 epoch 末落盘的话中途崩就全丢
 SAVE_EVERY=${SAVE_EVERY:-500}
@@ -71,9 +71,10 @@ SAVE_EVERY=${SAVE_EVERY:-500}
 LENGTH_BUCKET=${LENGTH_BUCKET:-64}
 # speaker 向量。SPK_MODEL_PATH 必须指向 **Base** 权重 —— speaker_encoder
 # 只在 tts_model_type=base 里有，VoiceDesign/CustomVoice 都是 0 张量。
+# 默认开：spk 文件放 qwen3_spk_emb/（1.78GB，行序与 train_codes.jsonl 对齐）。
 # 两个都留空 = 不带 speaker 槽位，行为与加 spk 之前完全一致。
-SPK_FILE=${SPK_FILE:-}
-SPK_MODEL_PATH=${SPK_MODEL_PATH:-}
+SPK_FILE=${SPK_FILE:-${WORK_ROOT}/dataset/wsj-mimo-data/qwen3_spk_emb/spk.f16}
+SPK_MODEL_PATH=${SPK_MODEL_PATH:-${WORK_ROOT}/quoteModel/Qwen3-TTS-12Hz-1.7B-Base}
 SPK_DROP_PROB=${SPK_DROP_PROB:-0}
 
 LOGDIR=${LOGDIR:-${WORK_ROOT}/logs}
