@@ -1190,6 +1190,43 @@ done
   6 步正常（(10, 2048) 向量加载）；阶段 8 时长差 53.3% instruct 生效。
 - 剩 #2（全量三步）与 #3（多卡才需要）。
 
+### 16.1 spk 该什么时候抽（推荐顺序）
+
+spk 有两种抽法，**产出逐位相同**（已验）：
+
+| 方式 | 命令 | 什么时候用 |
+|---|---|---|
+| 跟 codes 同一遍 | `SPK_FILE=... bash run_v2_npu_debug.sh` | 从头跑，省一次 wav 读取 |
+| **独立抽** | `prepare_data.py --spk-only --input_jsonl <codes.jsonl> --spk_out ... --spk_model_path <1.7B-Base>` | codes 已经抽完了；或想重抽 spk 而不动 codes |
+
+独立模式的对齐由 **codes.jsonl 自身的行顺序**保证（第 i 行的 audio 抽出第 i 行
+向量），天然不可能错位；带断点续跑，不需要 tokenizer、也不占 codes 那份显存。
+
+**推荐这么排**（关键是把唯一没验的假设提前到 5 分钟就能试出来）：
+
+```
+1. §11.3 第一步  全量数据准备（VAD 等）          数小时
+2. §11.3 第二步  全量抽 codes                    数小时
+3. 独立抽 spk    --spk-only（SPK_MEL_THREADS 用冒烟给的值）   约 0.6h
+4. ★ 小批量验 spk：拿前 256 条 + 对应 spk 跑 200 步再听        约 5 分钟
+5. §11.3 第三步  全量训练                        19-21h
+```
+
+第 4 步是重点。**「Base 的 embedding 空间与 VoiceDesign 的 talker 是否兼容」
+是当前唯一没验证的假设**（§17.5 末尾），而它只能靠训练来验。放在这里花 5 分钟，
+比训完 19-21 小时才发现音色那一格没学到要划算得多：
+
+```bash
+head -256 $W/v2/train_codes.jsonl > /tmp/real256_codes.jsonl
+python prepare_data.py --spk-only --device npu:0   --input_jsonl /tmp/real256_codes.jsonl --spk_out /tmp/real256_spk.f16   --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base
+cd scripts && python npu_smoke_test.py --model_path $MDL   --codes_jsonl /tmp/real256_codes.jsonl --spk_file /tmp/real256_spk.f16   --stages 5-8 --steps 200
+```
+
+对比基线：§11.2 不带 spk 的同一批数据是 200 步 loss **3.3253 → 3.0212**、
+阶段 8 时长差 34.6%。带 spk 后**看两件事**：loss 是否仍降到同一量级（明显更差
+说明那一格在干扰而不是帮忙），以及阶段 8 的时长差是否还在（掉到个位数说明
+spk 把 instruct 的控制力压掉了 —— 那正是 ref==target 最担心的 shortcut）。
+
 **开跑前先确认这一条**（开发机无法验证，是本轮唯一的存疑项）：
 
 ```bash

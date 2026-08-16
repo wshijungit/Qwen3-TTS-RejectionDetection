@@ -18,7 +18,9 @@ import argparse
 import json
 import os
 import sys
+import time
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # 同目录的 spk_encoder
@@ -33,7 +35,7 @@ def main():
                         help="NPU 上传 npu:0")
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     parser.add_argument("--input_jsonl", type=str, required=True)
-    parser.add_argument("--output_jsonl", type=str, required=True)
+    parser.add_argument("--output_jsonl", type=str, default=None)
     # ---- speaker embedding（可选；给了 --spk_out 才抽）----
     # 与 audio_codes 同一遍抽，**续跑时两者必须同步截断**，否则第 i 行的 codes
     # 会配上第 j 条的音色，且训练时看不出任何异常。
@@ -41,9 +43,78 @@ def main():
                         help="speaker 向量落盘路径（裸 fp16，每行 2048 维）。不给则不抽")
     parser.add_argument("--spk_model_path", type=str, default=None,
                         help="Base 权重目录 —— speaker_encoder 只在 tts_model_type=base 里有")
+    parser.add_argument("--spk-only", action="store_true",
+                        help="只抽 speaker 向量，不抽 audio_codes。此时 --input_jsonl "
+                             "应直接指向**训练要用的那份 jsonl**（通常是已抽好的 "
+                             "codes.jsonl），逐行对应地产出 --spk_out，不需要 "
+                             "--output_jsonl / --tokenizer_model_path")
     args = parser.parse_args()
     if args.spk_out and not args.spk_model_path:
         raise SystemExit("--spk_out 需要同时给 --spk_model_path（指向 Base 权重）")
+    if args.spk_only:
+        if not args.spk_out:
+            raise SystemExit("--spk-only 需要 --spk_out")
+    elif not args.output_jsonl:
+        raise SystemExit("需要 --output_jsonl（或用 --spk-only 只抽 speaker 向量）")
+
+    # ---- --spk-only：只抽 speaker 向量 ----
+    # 与 codes 同一遍抽（coupled 模式）省一次 wav 读取，但把两件事绑死了：
+    # codes 已经抽完就没法再补 spk。这里提供独立模式 —— 对齐由 --input_jsonl
+    # **自身的行顺序**保证，第 i 行的 audio 抽出第 i 行向量，天然不可能错位。
+    if args.spk_only:
+        import librosa
+
+        from spk_encoder import SPK_ITEMSIZE, SPK_SR, extract_spk, load_speaker_encoder
+
+        with open(args.input_jsonl, encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+        if rows and "audio_codes" not in rows[0]:
+            print("提示：输入不含 audio_codes，看起来不是 codes.jsonl。"
+                  "spk 必须与**训练实际用的那份 jsonl** 逐行对应，"
+                  "顺序不同就会整体错位。", flush=True)
+
+        done = 0
+        if os.path.exists(args.spk_out):
+            size = os.path.getsize(args.spk_out)
+            done = size // SPK_ITEMSIZE
+            if size % SPK_ITEMSIZE:      # 崩在写一行的中间
+                with open(args.spk_out, "rb+") as f:
+                    f.truncate(done * SPK_ITEMSIZE)
+                print(f"续跑：丢弃尾部 {size % SPK_ITEMSIZE} 字节的残行", flush=True)
+            if done > len(rows):
+                raise SystemExit(
+                    f"{args.spk_out} 已有 {done} 行 > 输入 {len(rows)} 行 —— "
+                    f"输入很可能换过。删掉 {args.spk_out} 重抽。")
+            if done == len(rows):
+                print(f"已全部完成（{done} 行）"); return
+            if done:
+                print(f"续跑：已有 {done} 行，跳过", flush=True)
+
+        enc = load_speaker_encoder(args.spk_model_path, device=args.device)
+        print(f"已加载 speaker_encoder（{args.spk_model_path}）", flush=True)
+        t0, n = time.time(), 0
+        with open(args.spk_out, "ab") as fh:
+            for i, r in enumerate(rows[done:], start=done):
+                p = r["audio"]
+                try:
+                    wav, _ = librosa.load(p, sr=SPK_SR, mono=True)
+                    v = extract_spk(enc, wav, SPK_SR, device=args.device)
+                except Exception as e:
+                    raise RuntimeError(f"抽 speaker 向量失败（第 {i} 行）: {p} "
+                                       f"—— {type(e).__name__}: {e}")
+                fh.write(v.numpy().astype(np.float16).tobytes())
+                n += 1
+                if n % 2000 == 0:
+                    fh.flush()
+                    el = time.time() - t0
+                    print(f"  {i + 1}/{len(rows)}  {el / n * 1000:.1f} ms/条，"
+                          f"剩约 {(len(rows) - i - 1) * el / n / 3600:.2f}h", flush=True)
+        got = os.path.getsize(args.spk_out) // SPK_ITEMSIZE
+        if got != len(rows):
+            raise SystemExit(f"产出 {got} 行 != 输入 {len(rows)} 行")
+        print(f"完成 {got} 行 → {args.spk_out}"
+              f"（{(time.time() - t0) / max(n, 1) * 1000:.1f} ms/条）")
+        return
 
     # 不用 device_map：torch 2.1 + torch_npu 上 meta 快速加载路径会炸
     # （param[...] → torch.cuda._lazy_init → "Torch not compiled with CUDA enabled"），
