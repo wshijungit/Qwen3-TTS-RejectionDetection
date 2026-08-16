@@ -27,7 +27,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # 同目录的 
 
 from qwen_tts import Qwen3TTSTokenizer
 
-BATCH_INFER_NUM = 32
+# batch 32 在全量真实数据上会 NPU OOM：VAD 后最长 24s（p99=10.5s，>8s 占 3.5%），
+# batch 内补零到最长样本时 tokenizer 的 torch.cdist 中间张量按 B×T 放大，
+# 实测 32 条含一条长样本时一次要 25.3GiB（卡 61GiB，已占 26GiB）。
+# 降到 8：峰值 ∝ max_T×B 降 4 倍，代价是抽码批次数 4 倍（约 8-15h，断点续跑）。
+BATCH_INFER_NUM = 8
 
 def main():
     parser = argparse.ArgumentParser()
