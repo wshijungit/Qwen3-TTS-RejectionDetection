@@ -503,8 +503,8 @@ def s4b_pipeline(model_path, workdir, device, n=12, spk_model_path=None):
         import spk_encoder as _se
 
         old_th = _se.SPK_MEL_THREADS
-        cand, best, base = (0, 1, 2, 4, 8), None, None
-        for nt in cand:
+        best, base, cur_ms = None, None, None
+        for nt in (0, 1, 2, 4, 8):
             _se.SPK_MEL_THREADS = nt
             for _ in range(2):
                 _se.extract_spk(e_dev, w, SPK_SR, device=device)
@@ -513,18 +513,27 @@ def s4b_pipeline(model_path, workdir, device, n=12, spk_model_path=None):
                 _se.extract_spk(e_dev, w, SPK_SR, device=device)
             ms = (time.time() - t0) / 8 * 1000
             if nt == 0:
-                base = ms
+                base = ms          # 不限线程，只用于展示"不设的话有多糟"
+            if nt == old_th:
+                cur_ms = ms        # 代码当前默认值，算"还能再省多少"要用它
             if best is None or ms < best[1]:
                 best = (nt, ms)
         _se.SPK_MEL_THREADS = old_th
-        hrs = best[1] * 435000 / 3600000
         tag = "不限（torch 默认）" if best[0] == 0 else str(best[0])
         ok(f"  SPK_MEL_THREADS 实测最优 = {tag}（{best[1]:.1f} ms/条，"
-           f"43.5w 条约 {hrs:.1f}h；默认不限时 {base:.1f} ms/条）")
-        if best[0] != old_th:
-            warn(f"当前默认值是 {old_th}，本机最优是 {tag} —— "
-                 f"全量抽码前设 SPK_MEL_THREADS={best[0]} 可省 "
-                 f"{(base - best[1]) * 435000 / 3600000:.1f} 小时")
+           f"43.5w 条约 {best[1] * 435000 / 3600000:.1f}h；"
+           f"不设时 {base:.1f} ms/条 = {base * 435000 / 3600000:.1f}h）")
+        # 省多少要跟**当前默认值**比，不是跟"不限线程"比 —— 后者会把
+        # "设不设这个变量"的收益算进"改不改默认值"的头上，夸大几百倍
+        if best[0] != old_th and cur_ms is not None:
+            saved = (cur_ms - best[1]) * 435000 / 3600000
+            if saved >= 0.2:
+                warn(f"当前默认值 {old_th} 是 {cur_ms:.1f} ms/条，本机最优 {tag} 是 "
+                     f"{best[1]:.1f} ms/条 —— 全量抽码前设 SPK_MEL_THREADS={best[0]} "
+                     f"可再省 {saved:.1f} 小时")
+            else:
+                ok(f"  默认值 {old_th}（{cur_ms:.1f} ms/条）与最优仅差 "
+                   f"{saved * 60:.0f} 分钟，不用改")
         del e_dev, e_cpu
         if hasattr(_t, "npu"):
             try:

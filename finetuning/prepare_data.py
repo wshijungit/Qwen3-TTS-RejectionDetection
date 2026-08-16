@@ -62,16 +62,42 @@ def main():
     # codes 已经抽完就没法再补 spk。这里提供独立模式 —— 对齐由 --input_jsonl
     # **自身的行顺序**保证，第 i 行的 audio 抽出第 i 行向量，天然不可能错位。
     if args.spk_only:
+        import hashlib
+
         import librosa
 
-        from spk_encoder import SPK_ITEMSIZE, SPK_SR, extract_spk, load_speaker_encoder
+        from spk_encoder import SPK_DIM, SPK_ITEMSIZE, SPK_SR, extract_spk, load_speaker_encoder
 
+        # 只留 audio 字段：codes.jsonl 里的 audio_codes 是 Python list of int，
+        # 43.5w 条整份读进来约 10.5GB（sft 侧为此专门压成了 numpy int16）。
+        # 这条路径只需要每行的路径，约 100MB。
+        audios, first = [], None
         with open(args.input_jsonl, encoding="utf-8") as f:
-            rows = [json.loads(l) for l in f if l.strip()]
-        if rows and "audio_codes" not in rows[0]:
+            for ln, l in enumerate(f, 1):
+                if not l.strip():
+                    continue
+                d = json.loads(l)
+                if first is None:
+                    first = d
+                if "audio" not in d:
+                    raise SystemExit(
+                        f"{args.input_jsonl} 第 {ln} 行没有 audio 字段，"
+                        f"有的是 {sorted(d)[:6]}")
+                audios.append(d["audio"])
+        if first is not None and "audio_codes" not in first:
             print("提示：输入不含 audio_codes，看起来不是 codes.jsonl。"
                   "spk 必须与**训练实际用的那份 jsonl** 逐行对应，"
                   "顺序不同就会整体错位。", flush=True)
+
+        # 输入指纹：行数相同但内容/顺序变了的话，单看行数完全发现不了 ——
+        # 续跑会把旧输入抽的前 done 行留下，与新输入整体错位。训练侧
+        # open_spk_memmap 只查总行数，也拦不住。这类错训练不报错，
+        # 只是每条音频配了别人的音色。
+        fp = hashlib.md5()
+        for a in audios:
+            fp.update(a.encode("utf-8")); fp.update(b"\0")
+        fp = fp.hexdigest()
+        meta_path = args.spk_out + ".meta"
 
         done = 0
         if os.path.exists(args.spk_out):
@@ -81,37 +107,65 @@ def main():
                 with open(args.spk_out, "rb+") as f:
                     f.truncate(done * SPK_ITEMSIZE)
                 print(f"续跑：丢弃尾部 {size % SPK_ITEMSIZE} 字节的残行", flush=True)
-            if done > len(rows):
+            if done:
+                if not os.path.exists(meta_path):
+                    raise SystemExit(
+                        f"{args.spk_out} 已有 {done} 行，但找不到 {meta_path} —— "
+                        f"无法确认它是不是用同一份输入抽的。\n"
+                        f"（旧版本产出的文件没有 .meta）删掉 {args.spk_out} 重抽。")
+                with open(meta_path, encoding="utf-8") as f:
+                    meta = json.load(f)
+                if meta.get("md5") != fp or meta.get("n") != len(audios):
+                    raise SystemExit(
+                        f"{args.spk_out} 是用**另一份输入**抽的，续跑会整体错位：\n"
+                        f"  已有: {meta.get('n')} 行, md5 {str(meta.get('md5'))[:12]}, "
+                        f"输入 {meta.get('input')}\n"
+                        f"  现在: {len(audios)} 行, md5 {fp[:12]}, 输入 {args.input_jsonl}\n"
+                        f"删掉 {args.spk_out} 和 {meta_path} 重抽。")
+            if done > len(audios):
                 raise SystemExit(
-                    f"{args.spk_out} 已有 {done} 行 > 输入 {len(rows)} 行 —— "
+                    f"{args.spk_out} 已有 {done} 行 > 输入 {len(audios)} 行 —— "
                     f"输入很可能换过。删掉 {args.spk_out} 重抽。")
-            if done == len(rows):
+            if done == len(audios):
                 print(f"已全部完成（{done} 行）"); return
             if done:
                 print(f"续跑：已有 {done} 行，跳过", flush=True)
 
         enc = load_speaker_encoder(args.spk_model_path, device=args.device)
         print(f"已加载 speaker_encoder（{args.spk_model_path}）", flush=True)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"n": len(audios), "md5": fp,
+                       "input": os.path.abspath(args.input_jsonl),
+                       "spk_model": os.path.abspath(args.spk_model_path)}, f)
+
         t0, n = time.time(), 0
         with open(args.spk_out, "ab") as fh:
-            for i, r in enumerate(rows[done:], start=done):
-                p = r["audio"]
+            for i, p in enumerate(audios[done:], start=done):
                 try:
                     wav, _ = librosa.load(p, sr=SPK_SR, mono=True)
                     v = extract_spk(enc, wav, SPK_SR, device=args.device)
                 except Exception as e:
                     raise RuntimeError(f"抽 speaker 向量失败（第 {i} 行）: {p} "
                                        f"—— {type(e).__name__}: {e}")
+                # 第一条就查维度：0.6B-Base 的 enc_dim 是 1024，而它
+                # speaker_encoder_config 存在、权重也自洽，load 阶段查不出来。
+                # 不在这里拦，43.5w 条会**完整跑完数小时**才在末尾行数对不上时报错，
+                # 且续跑接上正确模型后文件是 1024/2048 维交错的废数据。
+                if v.shape[0] != SPK_DIM:
+                    raise SystemExit(
+                        f"抽出的向量是 {v.shape[0]} 维，不是 {SPK_DIM} 维 —— "
+                        f"{args.spk_model_path} 多半是 0.6B-Base（enc_dim=1024）。"
+                        f"V2 用的 VoiceDesign 是 1.7B，必须配 1.7B-Base。")
                 fh.write(v.numpy().astype(np.float16).tobytes())
                 n += 1
                 if n % 2000 == 0:
                     fh.flush()
                     el = time.time() - t0
-                    print(f"  {i + 1}/{len(rows)}  {el / n * 1000:.1f} ms/条，"
-                          f"剩约 {(len(rows) - i - 1) * el / n / 3600:.2f}h", flush=True)
+                    print(f"  {i + 1}/{len(audios)}  {el / n * 1000:.1f} ms/条，"
+                          f"剩约 {(len(audios) - i - 1) * el / n / 3600:.2f}h", flush=True)
         got = os.path.getsize(args.spk_out) // SPK_ITEMSIZE
-        if got != len(rows):
-            raise SystemExit(f"产出 {got} 行 != 输入 {len(rows)} 行")
+        if got != len(audios):
+            raise SystemExit(f"产出 {got} 行 != 输入 {len(audios)} 行")
         print(f"完成 {got} 行 → {args.spk_out}"
               f"（{(time.time() - t0) / max(n, 1) * 1000:.1f} ms/条）")
         return
@@ -180,9 +234,13 @@ def main():
             # 正常流程里 spk 先写、jsonl 后写，spk 只可能多不可能少。
             raise SystemExit(
                 f"{args.spk_out} 只有 {cur / SPK_ITEMSIZE:.1f} 行，少于 jsonl 的 {done} 行。\n"
-                f"常见原因：上一轮没带 --spk_out 就抽了 codes，这轮才加上 —— "
-                f"spk 只能与 codes 同一遍抽，没法事后补。\n"
-                f"删掉 {args.spk_out}（若有）和 {args.output_jsonl} 重抽。")
+                f"常见原因：上一轮没带 --spk_out 就抽了 codes，这轮才加上。\n"
+                f"**不要删 {args.output_jsonl}**（那是数小时的产出），"
+                f"用独立模式补抽即可：\n"
+                f"  python prepare_data.py --spk-only --device {args.device} \\\n"
+                f"    --input_jsonl {args.output_jsonl} \\\n"
+                f"    --spk_out {args.spk_out} --spk_model_path {args.spk_model_path}\n"
+                f"（先删掉已有的 {args.spk_out}）")
         if cur > want:
             with open(args.spk_out, "rb+") as f:
                 f.truncate(want)

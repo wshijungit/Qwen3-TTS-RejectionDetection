@@ -1197,7 +1197,7 @@ spk 有两种抽法，**产出逐位相同**（已验）：
 | 方式 | 命令 | 什么时候用 |
 |---|---|---|
 | 跟 codes 同一遍 | `SPK_FILE=... bash run_v2_npu_debug.sh` | 从头跑，省一次 wav 读取 |
-| **独立抽** | `prepare_data.py --spk-only --input_jsonl <codes.jsonl> --spk_out ... --spk_model_path <1.7B-Base>` | codes 已经抽完了；或想重抽 spk 而不动 codes |
+| **独立抽** | `prepare_data.py --spk-only --device npu:0 --input_jsonl <codes.jsonl> --spk_out ... --spk_model_path <1.7B-Base>` | codes 已经抽完了；或想重抽 spk 而不动 codes |
 
 独立模式的对齐由 **codes.jsonl 自身的行顺序**保证（第 i 行的 audio 抽出第 i 行
 向量），天然不可能错位；带断点续跑，不需要 tokenizer、也不占 codes 那份显存。
