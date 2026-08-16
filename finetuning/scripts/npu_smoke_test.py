@@ -495,6 +495,36 @@ def s4b_pipeline(model_path, workdir, device, n=12, spk_model_path=None):
         if not np2.array_equal(v_dev, v2):
             return fail("同一设备重复抽取结果不同", "非确定性，续跑会产生前后不一致的向量")
         ok("  spk 抽取确定性：同一音频两次完全一致")
+
+        # ---- SPK_MEL_THREADS 该设多少：本机实测，别照抄开发机的默认值 ----
+        # mel 在 CPU 上算，torch 默认拿全部核跑一段 1-4s 音频的小 STFT，纯调度开销。
+        # 开发机（192 核）实测默认 77.6 ms/条 vs 线程=4 的 6.1 ms/条 —— 43.5w 条
+        # 就是 9.4h vs 0.74h。昇腾核数不同，最优值也可能不同，故当场量一遍。
+        import spk_encoder as _se
+
+        old_th = _se.SPK_MEL_THREADS
+        cand, best, base = (0, 1, 2, 4, 8), None, None
+        for nt in cand:
+            _se.SPK_MEL_THREADS = nt
+            for _ in range(2):
+                _se.extract_spk(e_dev, w, SPK_SR, device=device)
+            t0 = time.time()
+            for _ in range(8):
+                _se.extract_spk(e_dev, w, SPK_SR, device=device)
+            ms = (time.time() - t0) / 8 * 1000
+            if nt == 0:
+                base = ms
+            if best is None or ms < best[1]:
+                best = (nt, ms)
+        _se.SPK_MEL_THREADS = old_th
+        hrs = best[1] * 435000 / 3600000
+        tag = "不限（torch 默认）" if best[0] == 0 else str(best[0])
+        ok(f"  SPK_MEL_THREADS 实测最优 = {tag}（{best[1]:.1f} ms/条，"
+           f"43.5w 条约 {hrs:.1f}h；默认不限时 {base:.1f} ms/条）")
+        if best[0] != old_th:
+            warn(f"当前默认值是 {old_th}，本机最优是 {tag} —— "
+                 f"全量抽码前设 SPK_MEL_THREADS={best[0]} 可省 "
+                 f"{(base - best[1]) * 435000 / 3600000:.1f} 小时")
         del e_dev, e_cpu
         if hasattr(_t, "npu"):
             try:
