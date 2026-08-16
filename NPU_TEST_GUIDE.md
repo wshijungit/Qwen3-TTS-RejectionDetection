@@ -1262,6 +1262,23 @@ config 里会记 `v2_train_spk` / `v2_train_spk_drop_prob` 供推理侧对齐。
 | 续跑 spk 与 jsonl 同步截断 | 行边界/半行两种截断后行数都对齐 |
 | 不给 spk 的回归 | 块宽仍 5，冒烟 5/6/7 全过 |
 
+### 17.5b 昇腾上必须自己验的（冒烟已自动做，跑 `--spk_model_path` 就会执行）
+
+抽 spk 这条路径在昇腾上有两个不确定处，冒烟阶段 4b 现在会自动查：
+
+| 查什么 | 为什么 | 判据 |
+|---|---|---|
+| **NPU vs CPU 抽出的向量一致** | ECAPA 的 Conv1d/BatchNorm1d/attentive-pooling 在昇腾上数值是否一致没人验过。这批向量要喂进 43.5w 条，错了事后从 loss 上完全看不出来 | 余弦 ≥ 0.999，否则当场 fail 并提示"别用它抽全量" |
+| **同设备重复抽取确定性** | 非确定的话，续跑接出来的后半段与前半段不是同一套向量 | 两次逐位相同 |
+
+开发机实测：`cuda:0` vs CPU **余弦 1.000000，最大绝对差 9.83e-04**
+（fp32 累加顺序差异，正常）；重复抽取逐位相同。
+
+**已经绕开的一个坑**：`mel_spectrogram` 内含 `torch.stft`，而 torch_npu 2.1 的
+stft 支持一直不稳。当前实现里 **mel 在 CPU 上算**，只有 ECAPA 前向在设备上
+（与官方 `extract_speaker_embedding` 的做法相同），所以不碰 NPU 的 stft。
+**改这段代码时不要顺手把 mel 挪到设备上。**
+
 **没验的**：Base 的 embedding 空间与 VoiceDesign 的 talker 是否真的兼容。
 VoiceDesign 是从 Base 继续训的，可能已经漂了。这一格是靠微调重新学出来的，
 不是拿来即用 —— 只有真跑完听音色才知道。

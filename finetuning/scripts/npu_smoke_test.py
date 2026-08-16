@@ -465,6 +465,42 @@ def s4b_pipeline(model_path, workdir, device, n=12, spk_model_path=None):
                 return fail(f"续跑（{tag}截断）后 spk 有 {rows_spk:.1f} 行、"
                             f"jsonl 有 {len(got2)} 行", "两者已错位")
             ok(f"  spk 文件同步对齐到 {len(got2)} 行")
+
+    # ---- spk 的设备一致性：同一条音频在 NPU 与 CPU 上各抽一次 ----
+    # mel_spectrogram（内含 torch.stft）跑在 CPU 上，只有 ECAPA 前向在设备上
+    # —— 正好绕开 torch_npu 2.1 的 stft 支持问题。但 ECAPA 的
+    # Conv1d/BatchNorm1d/attentive-pooling 在昇腾上是否数值一致没人验过，
+    # 而这批向量要喂进 43.5w 条训练数据，错了事后从 loss 上看不出来。
+    if spk_path and not str(device).startswith("cpu"):
+        import librosa
+        import numpy as np2
+        import torch as _t
+
+        from spk_encoder import SPK_SR, extract_spk, load_speaker_encoder
+
+        wav0 = got[0]["audio"]
+        w, _ = librosa.load(wav0, sr=SPK_SR, mono=True)
+        e_dev = load_speaker_encoder(spk_model_path, device=device)
+        e_cpu = load_speaker_encoder(spk_model_path, device="cpu")
+        v_dev = extract_spk(e_dev, w, SPK_SR, device=device).numpy()
+        v_cpu = extract_spk(e_cpu, w, SPK_SR, device="cpu").numpy()
+        cos = float(v_dev @ v_cpu / (np2.linalg.norm(v_dev) * np2.linalg.norm(v_cpu)))
+        mad = float(np2.abs(v_dev - v_cpu).max())
+        if cos < 0.999:
+            return fail(f"{device} 与 CPU 抽出的 spk 余弦只有 {cos:.5f}（最大绝对差 {mad:.3e}）",
+                        "ECAPA 在该设备上数值不一致，别用它抽全量")
+        ok(f"  spk 设备一致性：{device} vs CPU 余弦 {cos:.6f}，最大绝对差 {mad:.2e}")
+        # 同一设备重复抽必须完全一致，否则续跑接出来的向量和前半段对不上
+        v2 = extract_spk(e_dev, w, SPK_SR, device=device).numpy()
+        if not np2.array_equal(v_dev, v2):
+            return fail("同一设备重复抽取结果不同", "非确定性，续跑会产生前后不一致的向量")
+        ok("  spk 抽取确定性：同一音频两次完全一致")
+        del e_dev, e_cpu
+        if hasattr(_t, "npu"):
+            try:
+                _t.npu.empty_cache()
+            except Exception:
+                pass
     return (codes, spk_path)
 
 
