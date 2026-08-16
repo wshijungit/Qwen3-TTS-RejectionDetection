@@ -1672,3 +1672,18 @@ speaker 向量 (435000, 2048) ← .../spk.f16（drop_prob=0.0）
 **唯一仍未验证的**：Base 的 embedding 空间与 VoiceDesign talker 是否真的兼容。
 256 条那轮的两个判据都过了（loss 同量级、时长差仍两位数），但那只说明
 「没有变坏」，音色到底跟不跟得住得训完听。
+
+### 十三轮（NPU 侧）：全量三步跑完（2026-08-17）
+
+1. **全量数据准备完成**：train **432,211** + validate 500（accept 63.5% / reject
+   36.5%），wav_not_found=0、VAD 丢弃率 <0.06%、无偏斜告警。产物落
+   `qwen_tts_exp/data/v2/`（用户指定的实验根目录，§4 路径表已更新）
+2. **抽码首跑 NPU OOM**：batch=32 时批内含长样本（VAD 后 max 24s、p99 10.5s、
+   >8s 占 3.5%），tokenizer 的 cdist 一次请求 25.3GiB、叠加已有 26.3GiB 占用后
+   峰值 ~51.6GB 逼近 61GB 上限 → `BATCH_INFER_NUM` 32→**8**，实测 4h 跑完
+   （断点续跑有效）。更优解是按时长组 batch（未做，8 已够用）
+3. **spk 全量 3.4h**（28.4ms/条，比预估 8h 快一倍多，SFS 缓存热）。自查全过：
+   行数一致、全零 0、NaN/Inf 0、去均值两两余弦 **0.000**（音色充分分散）
+4. chain watcher（`qwen_tts_exp/logs/chain_123.sh`）串联三步，中间校验
+   wav_not_found/偏斜；教训：chain 脚本 `set -u` 会撞 CANN set_env.sh 的
+   CMAKE_PREFIX_PATH 裸引用（§8.3 的坑第一次实际踩到）
