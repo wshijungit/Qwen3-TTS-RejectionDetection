@@ -250,7 +250,12 @@ def _save(accelerator, model, args, MODEL_PATH, tag):
                     if n.endswith((".safetensors", ".bin", ".pt"))
                     and os.path.isfile(os.path.join(d, n))}
 
-        shutil.copytree(MODEL_PATH, out_dir, dirs_exist_ok=True, ignore=_skip_top_weights)
+        # 热启（MODEL_PATH 指向上一轮的 checkpoint）时若 gstep 撞回同一个序号，
+        # out_dir 就等于 MODEL_PATH，copytree 会边走边往自己里面拷 → SameFileError
+        # 在第 N 小时把训练崩掉。此时源文件本来就在原地，直接跳过。
+        if os.path.abspath(out_dir) != os.path.abspath(MODEL_PATH):
+            shutil.copytree(MODEL_PATH, out_dir, dirs_exist_ok=True,
+                            ignore=_skip_top_weights)
 
         # 保持 voice_design —— 官方脚本这里硬写 custom_voice，产出的 ckpt 会被
         # qwen3_tts_model.py:686 的 != "voice_design" 直接拒掉
@@ -285,11 +290,15 @@ def _save(accelerator, model, args, MODEL_PATH, tag):
             root = args.output_model_path
             # 用正则严格匹配纯数字后缀：有人手工留个 checkpoint-step500.bak 目录，
             # int("500.bak") 会在第 N 小时抛异常直接搞死训练
+            # 按**落盘时间**而不是 step 序号排：热启是权重级的，gstep 从 0 重数，
+            # 而目录里还留着上一轮的 checkpoint-step54000。按序号排的话新存的
+            # step500 永远最小 —— 存完当场被自己删掉，热启后的十几个小时里
+            # --save-every 完全失效，再崩一次又是全丢。
             steps = sorted(
                 (d for d in os.listdir(root)
                  if re.fullmatch(r"checkpoint-step\d+", d)
                  and os.path.isdir(os.path.join(root, d))),
-                key=lambda d: int(d[len("checkpoint-step"):] or 0),
+                key=lambda d: os.path.getmtime(os.path.join(root, d)),
             )
             for old in steps[: -args.save_total_limit]:
                 shutil.rmtree(os.path.join(root, old), ignore_errors=True)

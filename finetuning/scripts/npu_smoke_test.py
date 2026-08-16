@@ -579,7 +579,7 @@ def s7_ckpt(ckpt_root):
     for f in need:
         if not os.path.exists(os.path.join(d, f)):
             return fail(f"缺 {f}")
-    ok("config.json + model.safetensors 都在")
+    ok("config.json + 顶层 model.safetensors + speech_tokenizer/model.safetensors 都在")
     if os.path.exists(os.path.join(d, "model.safetensors.index.json")):
         return fail("残留 index.json", "会让新写的单文件失效，加载时静默读回原始权重")
     ok("无残留 index.json")

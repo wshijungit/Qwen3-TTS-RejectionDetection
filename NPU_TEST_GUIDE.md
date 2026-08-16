@@ -649,7 +649,7 @@ npu_env.sh 后 TBE 崩溃消失，见命令注释）、阶段 5 七项全 PASS�
 #### 第一步：全量数据准备
 
 ```bash
-S=/home/ma-user/work/dataset/duplex_whj_data/stc_data
+S=/home/ma-user/work/dataset/stc_data/dataset/cabin_duplex_data_artif
 W=/home/ma-user/work/dataset/duplex_whj_data
 cd finetuning
 
@@ -704,7 +704,8 @@ bash run_v2_npu_debug.sh
 - `--save-total-limit`（默认 **2**）：只保留最近 2 个 step ckpt，epoch ckpt 不受限
 - 保存时 `copytree` 跳过 `*.safetensors` —— 原先每次白搬 3.4GB 权重再被覆盖
 
-**约 470GB → 约 11GB。**
+**约 470GB → 约 13GB**（2 个 step ckpt + epoch ckpt，每个约 4.3GB，
+含子目录里 682MB 的 speech_tokenizer）。
 
 多卡的话先跑一次 `check_ddp_sync.py`（§9.3）确认梯度真的在同步 —— 那个检查在
 NPU 的 HCCL 路径上还没验过。
@@ -715,14 +716,22 @@ NPU 的 HCCL 路径上还没验过。
 唯一方式是拿最近的 step checkpoint 当新的初始权重重启：
 
 ```bash
+E=/home/ma-user/work/quoteModel/duplex_whj_exp/v2_single_text_turn_tts
+ls $E/debug          # 先看最近的是哪个 checkpoint-stepNNNN
+
 cd scripts
-MODEL_PATH=$W/v2/exp/checkpoint-step54000 \
+MODEL_PATH=$E/debug/checkpoint-step54000 \
+OUTPUT_DIR=$E/debug_resume1 \
 SKIP_PREPARE=1 BATCH_SIZE=8 GRAD_ACCUM=1 EPOCHS=1 \
 bash run_v2_npu_debug.sh
 ```
 
+`$E/debug` 就是第三步不指定 `OUTPUT_DIR` 时的默认落盘位置（见
+`run_v2_npu_debug.sh`）。**`OUTPUT_DIR` 要换一个新目录**：热启是权重级的，
+`gstep` 从 0 重数，写回原目录的话新旧 checkpoint 的 step 号会混在一起。
+
 这是**权重级热启**：optimizer 状态丢失、数据重新 shuffle，但权重接上了。
-对单 epoch 的全量训练够用。
+对单 epoch 的全量训练够用。再崩一次就 `debug_resume2`，依次往下接。
 
 > ckpt 必须完整才能这么用。早先版本的 `_save` 用 `ignore_patterns` 跳过权重时
 > **递归误伤了 `speech_tokenizer/model.safetensors`**（682MB），产出的 ckpt

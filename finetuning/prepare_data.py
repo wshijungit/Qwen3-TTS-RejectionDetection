@@ -58,13 +58,23 @@ def main():
         # 当成完整一行跳过，下一条 JSON 追加在它后面粘成非法行 —— 实测 6 条输入
         # 只剩 5 行且 1 行损坏，且要等数小时后训练启动 json.loads 时才炸。
         # 故先把文件截断到最后一个完整换行处。
+        # 只回扫尾部：43.5w 条的输出有数 GB，f.read() 会造成等量内存尖峰。
         with open(args.output_jsonl, "rb+") as f:
-            raw = f.read()
-            if raw and not raw.endswith(b"\n"):
-                cut = raw.rfind(b"\n")
-                f.seek(0)
-                f.truncate(cut + 1 if cut >= 0 else 0)
-                print(f"续跑：丢弃尾部 {len(raw) - (cut + 1)} 字节的残行", flush=True)
+            size = f.seek(0, os.SEEK_END)
+            if size:
+                f.seek(size - 1)
+                if f.read(1) != b"\n":
+                    cut, blk = -1, 1 << 20
+                    pos = size
+                    while pos > 0 and cut < 0:
+                        pos = max(0, pos - blk)
+                        f.seek(pos)
+                        chunk = f.read(min(blk, size - pos))
+                        i = chunk.rfind(b"\n")
+                        if i >= 0:
+                            cut = pos + i
+                    f.truncate(cut + 1 if cut >= 0 else 0)
+                    print(f"续跑：丢弃尾部 {size - (cut + 1)} 字节的残行", flush=True)
         with open(args.output_jsonl, encoding="utf-8") as f:
             done = sum(1 for l in f if l.strip())
         if done:
@@ -81,9 +91,15 @@ def main():
         enc = tokenizer_12hz.encode(audios)
         # py3.9 没有 zip(strict=True)。若 encode 返回条数少于输入（异常音频等），
         # 那些行会静默消失，而续跑是按行数跳过的 —— 一旦少一行，之后的
-        # audio/text 与 codes 就整体错位且不报错。宁可当场崩，崩了还能续跑。
-        assert len(enc.audio_codes) == len(lines), (
-            f"encode 返回 {len(enc.audio_codes)} 条但输入 {len(lines)} 条")
+        # audio/text 与 codes 就整体错位且不报错。宁可当场崩。
+        #
+        # 不用 assert：python -O 会把它整个剥掉，这是 43.5w 条的对齐保命线，
+        # 不该寄托在解释器开关上。且这类失败是**确定性**的（同一个 wav 每次都崩），
+        # 续跑会卡死在同一批，所以报错必须带上是哪几个文件，好让人删掉再续。
+        if len(enc.audio_codes) != len(lines):
+            raise RuntimeError(
+                f"encode 返回 {len(enc.audio_codes)} 条但输入 {len(lines)} 条，"
+                f"本批文件：{[l.get('audio') for l in lines]}")
         for code, line in zip(enc.audio_codes, lines):
             # 不要写成 line["audio_codes"] = ...：line 是 total_lines 里的 dict，
             # 原地写入后引用仍在，codes 不会被回收，43.5w 条跑到尾部会积累约 13GB
