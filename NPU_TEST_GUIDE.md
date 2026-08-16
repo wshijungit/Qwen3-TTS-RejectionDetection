@@ -1170,6 +1170,29 @@ done
 3. 模型清单与下载法补进 §10.1（四个模型 + 各自主模型/tokenizer 校验值，
    0.6B-Base 的不匹配明确标注，防止后人拿错）
 
+### 十一轮（开发机）：spk 独立抽取 + 两轮 fable review（2026-08-16）
+
+`a2bda72..7b97f3c`。都是为「马上要在 43.5w 条上跑 spk 抽取」做的收口。
+
+1. **抽 spk 慢 12.7 倍，根因是线程过度订阅**：mel 在 CPU 算，torch 默认拿全部
+   192 核跑一段 1-4s 音频的小 STFT。加 `SPK_MEL_THREADS`（默认 4，只在算 mel
+   期间设、算完还原），77.6 → 6.1 ms/条，输出逐位相同。
+   （先试过缓存 `librosa_mel_fn` —— 实测只占 3%，方向错了，没做。）
+2. **新增 `--spk-only` 独立抽取**：原先 spk 只能与 codes 同一遍抽，codes 抽完
+   就没法补 —— 是我为防错位堵死的，但堵过头了。独立模式对齐靠输入自身行顺序，
+   与耦合模式产出**逐位相同**。
+3. **fable 抓到两个会毁掉整轮抽取的洞**：① 独立模式漏了 2048 维校验，拿错
+   0.6B-Base 会跑完数小时才发现（`load_speaker_encoder` 查不出来：0.6B 的
+   config 存在、权重自洽，只是 enc_dim=1024）；② 续跑对「输入换过但行数没变」
+   零检测，fable 用行序颠倒的同长度 jsonl **实测复现静默错位**。已分别加
+   首条维度校验和 `.meta` 输入指纹。
+4. **两处我自己写反/算错的**：场景 E 的报错还写着"没法事后补，删掉重抽"——
+   加了 `--spk-only` 后这话就错了，照做会删掉数小时的 codes 产物；
+   冒烟的"可省 X 小时"拿"不限线程"当基准，把"设不设变量"的收益算到了
+   "改不改默认值"头上，**夸大约 270 倍**（报 12.1 小时，实际 0.04 小时）。
+
+**教训延续**：这两条都是"改了一半"——加新功能时没回头看旧文案/旧算式还成不成立。
+
 ## 16. NPU 侧下一轮请跑什么（§14 的表已全部回填完毕）
 
 §14 那张表五项全部有结论了，**不要再按它跑**。现在只剩两件：
@@ -1189,6 +1212,81 @@ done
   （块宽 6、spk 槽位位置、spk_pos、mask、逐位一致、非全零）；阶段 6 含 spk 训练
   6 步正常（(10, 2048) 向量加载）；阶段 8 时长差 53.3% instruct 生效。
 - 剩 #2（全量三步）与 #3（多卡才需要）。
+
+**2026-08-16 追加（开发机侧又改了一轮，见 §16.2）**：`--spk-only` 独立抽取
+模式、维度校验、输入指纹、冒烟的线程扫描都是 #1 跑完之后才加的，
+**上面那份 spk 冒烟报告里不含这些**。所以 #1 需要**再跑一次**，见 §16.2。
+
+### 16.2 ⚠️ 抽全量 spk 之前必须先做的三件事
+
+`npu_smoke_report_spk.txt` 生成于 `355ea4b` 之前，之后加的东西它都没覆盖。
+**在 43.5w 条上跑 `--spk-only` 之前，请按顺序做完这三件并回填结果。**
+
+#### (1) 重跑一次带 spk 的冒烟 —— 主要是为了拿 `SPK_MEL_THREADS`
+
+```bash
+cd finetuning/scripts && . ./npu_env.sh
+python npu_smoke_test.py   --model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign   --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base   --use-pipeline-codes --report npu_smoke_report_spk2.txt
+```
+
+阶段 4b 现在会自动扫 `SPK_MEL_THREADS ∈ {不限,1,2,4,8}` 并打出本机最优值。
+**这段扫描逻辑只在 CUDA 上验过，从没在昇腾跑过**（本轮唯一的存疑项）。
+把那两行输出回填到下面：
+
+- 本机最优 `SPK_MEL_THREADS` = ______，______ ms/条，43.5w 条约 ______ h
+- 不设时 ______ ms/条 = ______ h
+
+开发机参考值：最优 8（4.5 ms/条 = 0.5h），不设时 45.4 ms/条 = 5.5h ——
+**差 10 倍**。核数不同结论可能不同，以你那边的输出为准。
+若最优值 ≠ 代码默认的 4 且差距 >0.2h，冒烟会直接 ⚠️ 提示设多少。
+
+#### (2) 确认 `--spk_model_path` 指的是 1.7B-Base
+
+```bash
+python -c "
+import json; c=json.load(open('/home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base/config.json'))
+print('enc_dim =', c['speaker_encoder_config']['enc_dim'], '（必须是 2048）')"
+```
+
+拿错成 0.6B-Base（`enc_dim=1024`）现在会在**第一条**就崩并明确报错，
+不会像以前那样跑完数小时才发现 —— 但早点确认省事。§10.1 的表里两个都列了。
+
+#### (3) 跑法与「报错了怎么办」
+
+```bash
+SPK_MEL_THREADS=<上面(1)拿到的值> python prepare_data.py --spk-only --device npu:0   --input_jsonl $W/v2/train_codes.jsonl   --spk_out $W/v2/spk.f16   --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base
+```
+
+每 2000 条打一次 `ms/条` 和剩余时间。中途崩了**重跑同一条命令**即可续跑。
+
+| 报错 | 意思 | 怎么办 |
+|---|---|---|
+| `抽出的向量是 1024 维` | 拿的是 0.6B-Base | 换 1.7B-Base，删掉已产出的 spk 文件重抽 |
+| `是用另一份输入抽的，续跑会整体错位` | spk 文件与当前 `--input_jsonl` 不是同一份（行数可能相同但内容/顺序变了） | 按提示删掉 `spk.f16` 和 `spk.f16.meta` 重抽 |
+| `已有 N 行，但找不到 .meta` | 旧版本产出的文件 | 删掉重抽 |
+| `第 N 行没有 audio 字段` | 输入不是 codes.jsonl / raw.jsonl | 检查 `--input_jsonl` |
+| `只有 X 行，少于 jsonl 的 Y 行` | 这是 **coupled 模式**（`SPK_FILE=`）才会报的 | **别删 codes.jsonl**，照报错里给的 `--spk-only` 命令补抽 |
+
+产出会多一个 `spk.f16.meta`（输入指纹），**别删它** —— 续跑靠它确认没换过输入。
+训练时只传 `spk.f16`。
+
+#### 抽完自查
+
+```bash
+python -c "
+import os,json,numpy as np
+n=sum(1 for l in open('$W/v2/train_codes.jsonl') if l.strip())
+sz=os.path.getsize('$W/v2/spk.f16')
+print('codes 行数', n, '| spk 行数', sz//4096, '| 一致:', sz==n*4096)
+v=np.memmap('$W/v2/spk.f16',dtype=np.float16,mode='r',shape=(n,2048)).astype(np.float32)
+print('全零行数:', int((np.abs(v).sum(1)==0).sum()), '（应为 0）')
+print('NaN/Inf 行数:', int((~np.isfinite(v)).any(1).sum()), '（应为 0）')
+V=v/np.linalg.norm(v,axis=1,keepdims=True); i=np.random.default_rng(0).choice(n,min(n,2000),replace=False)
+S=(V[i]-V[i].mean(0)); S/=np.linalg.norm(S,axis=1,keepdims=True)
+c=S@S.T; print('去均值后两两余弦 均值 %.3f（接近 0 说明音色确实分散，接近 1 说明都一样）'%c[~np.eye(len(i),dtype=bool)].mean())"
+```
+
+行数不一致的话训练启动时 `open_spk_memmap` 也会拦，但那是几小时后的事。
 
 ### 16.1 spk 该什么时候抽（推荐顺序）
 
@@ -1371,6 +1469,12 @@ SPK_MEL_THREADS=<冒烟给的值> SPK_FILE=... bash run_v2_npu_debug.sh
 
 开发机上冒烟实测最优是 **8**（4.6 ms/条 → 0.6h），而默认全核是 104.4 ms/条
 ——**差 22 倍、12.1 小时**。核数不同的机器最优值不同，所以别照抄，看冒烟输出。
+
+**VAD 后的音频会不会让抽取崩**（开发机实测，不用再担心）：`extract_spk` 能吃的
+最短音频是 **1280 采样点 @24k = 53ms**（再短 mel 的 reflect pad 会崩），而
+`prepare_v2_data.py` 的 `--min-dur` 默认 **0.3s** 且过短的直接丢进
+`vad_too_short` —— **余量 5.6 倍**。全零/近静音音频实测产出有限值向量（无 NaN），
+8s 长音频正常。所以 43.5w 条不会崩在音频形态上。
 
 **没验的**：Base 的 embedding 空间与 VoiceDesign 的 talker 是否真的兼容。
 VoiceDesign 是从 Base 继续训的，可能已经漂了。这一格是靠微调重新学出来的，
