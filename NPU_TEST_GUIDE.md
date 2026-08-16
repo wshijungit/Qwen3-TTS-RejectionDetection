@@ -483,13 +483,19 @@ loss 从 3.6 降到 1.1，**确认在真降不是抖**——bf16 之外的收敛
 
 1. **模型下载走 curl，不走 huggingface-cli**：本机代理
    （proxy-notebook.modelarts.com:8083）对 Python requests 的 CONNECT 隧道返回
-   503 Tunnel failed，但 curl 正常。且 VoiceDesign 仓库里
+   503 Tunnel failed，但 curl 正常。且各 TTS 仓库里
    `speech_tokenizer/speech_tokenizer/` 是内嵌子仓库，resolve 只返回
    「Entry not found」空指针——tokenizer 权重要从独立仓库
    `Qwen/Qwen3-TTS-Tokenizer-12Hz` 下载，摆平到 `<模型>/speech_tokenizer/` 下。
-   本机模型已就位：`/home/ma-user/work/dataset/wsj-mimo-data/Qwen3-TTS-ckpt`
-   （主模型 404 张量 / 1.917B / BF16；tokenizer 496 张量 / 170.6M / F32，
-   均用 safetensors 头校验过）。
+   本机四个模型已就位（均用 safetensors 头校验过，软链在
+   `/home/ma-user/work/model/`）：
+
+   | 模型 | 主模型 | tokenizer | 用途 |
+   |---|---|---|---|
+   | Qwen3-TTS-12Hz-1.7B-VoiceDesign | 404 张量 / 1.917B / BF16 | 496 / 170.6M / F32 | **V2 训练线** |
+   | Qwen3-TTS-12Hz-1.7B-Base | speaker_encoder 76 张量，enc_dim=2048 | 同上 | spk 抽取（§17） |
+   | Qwen3-TTS-12Hz-0.6B-Base | enc_dim=1024 | 同上 | ⚠️ 与 1.7B 的 2048 不匹配，**抽不了 V2 的 spk**（§17.6 回填） |
+   | Qwen3-TTS-12Hz-1.7B-CustomVoice | 404 / 1.917B / BF16 | 同上 | speaker_id 音色克隆路线（暂无训练线） |
 
 2. **`device_map` 的 meta 快速加载路径在 torch 2.1 + torch_npu 上不可用**：
    `from_pretrained(..., device_map="npu:0")` 走 low_cpu_mem_usage 的 meta 加载，
@@ -1152,6 +1158,17 @@ done
 
 **教训**：六条修复里有一条引入高危回归、一条根本没生效，共同点是**没有配一个
 「修前必失败」的验证**。九轮起每条修复都附反证用例（如「反证旧排序确实删掉新 ckpt」）。
+
+### 十轮（NPU 侧）：§16 任务 0/1 完成 + 四个模型就位（2026-08-16）
+
+1. §17.6 四条全部回填：sessionid 有（无说话人标识）；**0.6B-Base 的
+   enc_dim=1024 与 V2 的 2048 不匹配不可用**；已下载 1.7B-Base
+   （speaker_encoder 76 张量、enc_dim=2048）；$S 前缀确认正确
+2. 带 spk 冒烟 0-8 全过（§16 #1 回填）：4b 的 spk 与 jsonl 断点续跑同步对齐、
+   NPU/CPU 抽取余弦 1.0（max|Δ|=4.08e-04）、阶段 5 十三项全 PASS、
+   含 spk 训练 6 步正常、阶段 8 时长差 53.3%
+3. 模型清单与下载法补进 §10.1（四个模型 + 各自主模型/tokenizer 校验值，
+   0.6B-Base 的不匹配明确标注，防止后人拿错）
 
 ## 16. NPU 侧下一轮请跑什么（§14 的表已全部回填完毕）
 
