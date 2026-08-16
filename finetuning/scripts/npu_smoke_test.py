@@ -520,9 +520,20 @@ def s4b_pipeline(model_path, workdir, device, n=12, spk_model_path=None):
                 best = (nt, ms)
         _se.SPK_MEL_THREADS = old_th
         tag = "不限（torch 默认）" if best[0] == 0 else str(best[0])
-        ok(f"  SPK_MEL_THREADS 实测最优 = {tag}（{best[1]:.1f} ms/条，"
-           f"43.5w 条约 {best[1] * 435000 / 3600000:.1f}h；"
-           f"不设时 {base:.1f} ms/条 = {base * 435000 / 3600000:.1f}h）")
+        # 上面这些数**只含 encoder 前向**（复用已 load 好的 w）。真实
+        # --spk-only 每条还要 librosa.load + 重采样，NPU 侧实测那部分才是大头：
+        # encoder 15.3 ms/条，端到端 66.3 ms/条。所以全量耗时必须按端到端算，
+        # 否则会把 8h 说成 1.8h。这里再单独量一次真实的每条成本。
+        t0 = time.time()
+        for g in got[: min(8, len(got))]:
+            wv, _ = librosa.load(g["audio"], sr=SPK_SR, mono=True)
+            _se.extract_spk(e_dev, wv, SPK_SR, device=device)
+        e2e = (time.time() - t0) / min(8, len(got)) * 1000
+        ok(f"  SPK_MEL_THREADS 实测最优 = {tag}（encoder 前向 {best[1]:.1f} ms/条；"
+           f"不设时 {base:.1f} ms/条）")
+        ok(f"  端到端（含 librosa.load + 重采样）{e2e:.1f} ms/条 → "
+           f"43.5w 条约 **{e2e * 435000 / 3600000:.1f}h**（这个才是全量该看的数；"
+           f"网络盘/16k 源音频会让 load 成为大头）")
         # 省多少要跟**当前默认值**比，不是跟"不限线程"比 —— 后者会把
         # "设不设这个变量"的收益算进"改不改默认值"的头上，夸大几百倍
         if best[0] != old_th and cur_ms is not None:
@@ -770,6 +781,15 @@ def s8_infer(ckpt_dir, attn, workdir, language):
 # ---------------------------------------------------------------- main
 
 
+class _Abort(Exception):
+    """阶段失败后主动中止后续阶段用的**控制流**异常。
+
+    以前这里用的是 `raise SystemExit` + `except SystemExit: pass`，但阶段函数
+    内部（如 open_spk_memmap 的行数校验）抛的**真** SystemExit 会被同一个
+    except 吞掉 —— failed 里什么都没加，报告照打「全部通过 ✅」。
+    实测：--spk_file 指向空文件时，阶段 5 一项没验却报全过。
+    测试工具报假通过是最坏的一类失败，故换成自有异常，SystemExit 一律当真错误。
+    """
 def main():
     ap = argparse.ArgumentParser(description="V2 VoiceDesign 微调链路 NPU 冒烟测试")
     ap.add_argument("--model_path", required=True, help="VoiceDesign 权重目录")
@@ -813,6 +833,19 @@ def main():
     os.makedirs(wd, exist_ok=True)
     log(f"工作目录 {wd}\n模型 {args.model_path}\n阶段 {sorted(want)}")
 
+    # --spk_file 早查一次：不存在的话会一路走到 s5 里 open_spk_memmap 才炸，
+    # 报出来是个裸 FileNotFoundError（"失败阶段: -1"），看不出是路径写错了
+    if args.spk_file:
+        if not os.path.exists(args.spk_file):
+            print(f"❌ --spk_file 不存在: {args.spk_file}\n"
+                  f"   先用 prepare_data.py --spk-only 抽，或去掉 --spk_file")
+            sys.exit(2)
+        sz = os.path.getsize(args.spk_file)
+        if sz == 0 or sz % (2048 * 2):
+            print(f"❌ --spk_file 大小 {sz} 字节，不是 4096（2048×fp16）的正整数倍: "
+                  f"{args.spk_file}\n   文件是空的或被截断了，重抽")
+            sys.exit(2)
+
     state = {"codes": args.codes_jsonl, "ckpt_root": None, "ckpt": None,
              "spk": args.spk_file}
     failed = []
@@ -822,7 +855,7 @@ def main():
             ran.add(0)
             if not s0_env():
                 failed.append(0)
-                raise SystemExit
+                raise _Abort
         if 1 in want:
             ran.add(1)
             if not s1_ops():
@@ -835,7 +868,7 @@ def main():
             ran.add(3)
             if not s3_load(args.model_path, args.attn):
                 failed.append(3)
-                raise SystemExit
+                raise _Abort
         # 4b：生产数据准备链路回归（prepare_v2_data.py → prepare_data.py）。
         # 与阶段 4 一起默认跑；--skip-pipeline 跳过，--use-pipeline-codes 让后续
         # 阶段改用 4b 产出的 codes（而非阶段 4 的合成数据）
@@ -844,7 +877,7 @@ def main():
                                spk_model_path=args.spk_model_path)
             if not r4b:
                 failed.append("4b")
-                raise SystemExit
+                raise _Abort
             pipe_codes, pipe_spk = r4b
             if args.use_pipeline_codes:
                 state["codes"] = pipe_codes
@@ -865,7 +898,7 @@ def main():
                                           device=args.device)
                 if not state["codes"]:
                     failed.append(4)
-                    raise SystemExit
+                    raise _Abort
         if 5 in want and state["codes"]:
             ran.add(5)
             if not s5_layout(args.model_path, state["codes"], args.language,
@@ -879,7 +912,7 @@ def main():
                                           args.save_every, spk_file=state["spk"])
             if not state["ckpt_root"]:
                 failed.append(6)
-                raise SystemExit
+                raise _Abort
         if 7 in want and state["ckpt_root"]:
             ran.add(7)
             state["ckpt"] = s7_ckpt(state["ckpt_root"])
@@ -889,8 +922,13 @@ def main():
             ran.add(8)
             if not s8_infer(state["ckpt"], args.attn, wd, args.language):
                 failed.append(8)
-    except SystemExit:
+    except _Abort:
         pass
+    except SystemExit as e:
+        # 阶段函数里的硬校验（如 spk 行数不符）走这里 —— 必须计入 failed，
+        # 否则就是「一项没验却报全部通过」
+        log(f"\n阶段因硬校验失败中止：{e}")
+        failed.append("硬校验")
     except Exception:
         log("\n未预期异常：")
         for line in traceback.format_exc().split("\n"):
