@@ -1159,8 +1159,10 @@ done
 
 | # | 做什么 | 前置 | 卡在哪就停 |
 |---|---|---|---|
-| 1 | **全量 43.5w 条三步**：§11.3 数据准备 → 抽码 → 训练 | 开跑前先 `ls $S` 确认路径存在（见下） | 第一步报告里 `wav_not_found` ≠ 0 |
-| 2 | 多卡才需要：`check_ddp_sync.py`（§9.3） | 单卡跑全量的话可跳过 | 打 ❌ 就别跑多卡 |
+| 0 | 回答 §17.6 的两个数据问题（session 字段、Base 权重路径） | — | 没有 Base 权重就抽不了 spk |
+| 1 | 冒烟带 spk 跑一遍：`--spk_model_path <Base> --use-pipeline-codes` | 问题 2 有答案 | 阶段 5 任一 spk 项 FAIL |
+| 2 | **全量 43.5w 条三步**：§11.3 数据准备 → 抽码（带 `SPK_FILE`）→ 训练 | 开跑前先 `ls $S` 确认路径存在（见下） | 第一步报告里 `wav_not_found` ≠ 0 |
+| 3 | 多卡才需要：`check_ddp_sync.py`（§9.3） | 单卡跑全量的话可跳过 | 打 ❌ 就别跑多卡 |
 
 **开跑前先确认这一条**（开发机无法验证，是本轮唯一的存疑项）：
 
@@ -1173,3 +1175,112 @@ ls /home/ma-user/work/dataset/stc_data/dataset/cabin_duplex_data_artif/yibuapi_o
 
 `check_ddp_sync.py` 在 NCCL 和 HCCL 上都还没真跑过（脚本逻辑本身也未验证），
 单卡全量不需要它——batch=8 单卡约 19-21 小时，够用。
+
+## 17. speaker embedding（2026-08-16 新增，开发机 H200 已全验）
+
+V2 原本没有 speaker 槽位。加它的目的是**连续对话里同一说话人音色一致**
+（V4 要用），顺带让 V2 训出来的 ckpt 到 V4 不用重训架构。
+
+### 17.1 先搞清楚一件事：speaker_encoder 只在 Base 里
+
+| 权重 | `tts_model_type` | `speaker_encoder` 张量 |
+|---|---|---|
+| **Base** | `base` | **76** |
+| CustomVoice | `custom_voice` | 0（用 9 个预设 spk_id 查表） |
+| VoiceDesign | `voice_design` | 0 |
+
+`modeling_qwen3_tts.py:1845` 只在 `tts_model_type == "base"` 时才实例化它。
+所以想在 VoiceDesign 上用 speaker 槽位，**向量只能从 Base 那份权重来**。
+
+好在维度对得上（已核）：Base 的 `enc_dim = 2048` == VoiceDesign talker
+`hidden_size = 2048`，两边 codec 特殊 id（think/bos/eos/pad）也逐个相同。
+
+### 17.2 做法：离线抽，训练图里不含 encoder
+
+官方 `sft_12hz.py:82` 那行是 `speaker_encoder(ref_mels).detach()` —— **全程冻结**。
+既然冻结，离线算完存盘与在线现算数学上等价，而离线的好处是训练时模型里
+根本不含 speaker_encoder：显存/计算/checkpoint 全都不变，产出的 ckpt 仍是干净的
+VoiceDesign。新增 `finetuning/spk_encoder.py` 只加载那 76 个张量。
+
+**已验**：独立抽取器与 Base 模型自带的 `extract_speaker_embedding`
+**逐位相同**（最大绝对差 0.0）。
+
+存储：`[N, 2048]` 裸 fp16，43.5w 条 = **1.78GB**，训练侧 memmap 打开，
+不进常驻内存（audio_codes 存 Python list 撑到 78GB 的教训）。
+
+### 17.3 序列布局：块宽 5 → 6
+
+speaker 那格夹在 head 与 `[codec_pad, codec_bos]` 之间，与推理侧
+`cat(emb0, speaker_embed.view(1,1,-1), emb1)`（modeling:2216-2218）逐格对齐：
+
+```
+think, think_bos, lang, think_eos, [spk], codec_pad
+                                    ^ 这格的 embedding 被 spk 向量**整格覆盖**
+```
+
+两个容易写错的地方：
+
+- **是覆盖不是相加**。写成 `+=` 会掺进 codec_pad 的 embedding，训练与推理
+  在这一格上不一致，且不报错。
+- **位置不能写死**。官方 `sft_12hz.py:91` 是 `input_codec_embedding[:, 6, :]`，
+  但 V2 的 instruct 是变长前缀，每条样本的绝对位置都不同 —— collate 额外吐
+  `spk_pos` 逐条指定。
+
+不给 `--spk-file` 时块宽仍是 5，行为与加 spk 之前完全一致（已回归）。
+
+### 17.4 怎么跑
+
+```bash
+# 抽码时顺带抽 spk（Base 权重路径见 17.6 的问题 2）
+SPK_FILE=$W/v2/spk.f16 \
+SPK_MODEL_PATH=$WORK_ROOT/model/Qwen3-TTS-12Hz-1.7B-Base \
+bash run_v2_npu_debug.sh
+
+# 冒烟（阶段 4b 抽 + 5 逐格核对 + 6 带 spk 训练）
+python npu_smoke_test.py --model_path <VoiceDesign> \
+  --spk_model_path <Base> --use-pipeline-codes
+```
+
+`SPK_FILE` 留空 = 完全不启用，两个启动脚本都已透传（实测空值时不多出任何参数）。
+
+**`--spk-drop-prob` 默认 0**，即训练时每条都有 spk。这意味着
+**训完的模型必须永远给 spk** —— 不给就是训练中从未出现过的输入，不报错，
+只表现为音色/音质乱。想让同一个 ckpt 既能纯 instruct 又能带音色，调到 0.1-0.3。
+config 里会记 `v2_train_spk` / `v2_train_spk_drop_prob` 供推理侧对齐。
+
+### 17.5 开发机已验的（H200，全部实测）
+
+| 验什么 | 结果 |
+|---|---|
+| 独立抽取器 vs 官方 `extract_speaker_embedding` | **逐位相同**，最大差 0.0 |
+| 说话人判别力 | 原始余弦只差 +0.031（ECAPA 公共分量大），**去均值后同人 0.514 / 跨人 −0.311，间隔 +0.826 且不重叠** |
+| 抽取确定性 | 同一音频两次抽取完全一致 |
+| 布局逐格核对 | 块宽 5→6、spk 位置、label 整体右移 1、mask、两条 instruct 不等长时 spk_pos 各不相同 —— 18 项全过 |
+| 覆盖而非相加 | spk 格的 codec 分量 == spk 向量本身；确认没掺 codec_pad |
+| **这一格真的参与计算** | 换随机 spk → loss 4.15、置零 → 4.05、真实 → **3.90**（刚训 6 步就在用了） |
+| `--spk-drop-prob=1.0` | 与手工置零逐位一致 |
+| 续跑 spk 与 jsonl 同步截断 | 行边界/半行两种截断后行数都对齐 |
+| 不给 spk 的回归 | 块宽仍 5，冒烟 5/6/7 全过 |
+
+**没验的**：Base 的 embedding 空间与 VoiceDesign 的 talker 是否真的兼容。
+VoiceDesign 是从 Base 继续训的，可能已经漂了。这一格是靠微调重新学出来的，
+不是拿来即用 —— 只有真跑完听音色才知道。
+
+### 17.6 需要 NPU 侧回答的数据问题
+
+pull 到这版后请把答案直接写在本节下面：
+
+1. **打标 jsonl 里有没有 session / 说话人标识？**（字段名是什么）
+   现在用的是**逐 turn** 的 spk 向量 —— 即 ref 就是 target 自己。这样最简单，
+   但向量里带着"这一句实际的说话状态"，模型可能学会从 spk 读腔调、
+   让 instruct 退化成摆设。有 session 字段的话，以后可以改成**同 session 平均**
+   （平掉逐句韵律、只留音色），这既杀掉那个 shortcut，也更贴"同 session 音色一致"
+   的目标。现在不做，先跑第一版。
+
+2. **NPU 机上有没有 Base 权重？完整路径是什么？**
+   `$WORK_ROOT/model/Qwen3-TTS-12Hz-1.7B-Base` 是猜的。**没有 Base 就抽不了 spk**，
+   这一步会直接卡住（`spk_encoder.py` 会报 "没有 speaker_encoder_config"）。
+
+3. 磁盘：spk 文件 43.5w 条 ≈ 1.78GB，与 §11.3 的 13GB ckpt 账相加即可。
+
+4. （仍未答）§16 那条 `ls` —— `$S` 前缀到底是哪个。

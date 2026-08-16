@@ -69,23 +69,39 @@ class V2TrainStep(torch.nn.Module):
         with acc.autocast(): talker(x) -> bf16
     """
 
-    def __init__(self, qwen_model, sub_talker_weight):
+    def __init__(self, qwen_model, sub_talker_weight, spk_drop_prob=0.0):
         super().__init__()
         self.model = qwen_model
         self.sub_talker_weight = sub_talker_weight
+        self.spk_drop_prob = spk_drop_prob
 
     def forward(self, input_ids, codec_ids, text_embedding_mask,
-                codec_embedding_mask, attention_mask, codec_0_labels, codec_mask):
+                codec_embedding_mask, attention_mask, codec_0_labels, codec_mask,
+                spk_pos=None, spk_vec=None):
         talker = self.model.talker
 
         # 文本通道：必须过 text_projection，与推理侧一致（见文件头 §1）
         input_text_embedding = talker.text_projection(
             talker.model.text_embedding(input_ids[:, :, 0])
         ) * text_embedding_mask
-        # codec 通道：VoiceDesign 无 speaker 槽位，不注入 speaker_embedding
         input_codec_embedding = (
             talker.model.codec_embedding(input_ids[:, :, 1]) * codec_embedding_mask
         )
+        # speaker 那一格：**整格覆盖**，不是相加。推理侧是
+        # cat(emb0, speaker_embed.view(1,1,-1), emb1)（modeling:2216-2218）——
+        # 那一格里只有 spk 向量，没有任何 codec token 的 embedding 掺进去。
+        # 写成 += 会让训练与推理在这一格上不一致，且不报错。
+        if spk_pos is not None:
+            b = torch.arange(input_ids.shape[0], device=input_ids.device)
+            v = spk_vec.to(input_codec_embedding.dtype)
+            if self.spk_drop_prob > 0 and self.training:
+                # 按概率整条置零 = 退回「没有 speaker」的行为，让模型别把
+                # 音色当成唯一线索、instruct 退化成摆设。默认 0（用户要求先跑
+                # 最简版本）—— **drop=0 时训完必须永远给 spk，不给就是失配**。
+                keep = (torch.rand(v.shape[0], device=v.device) >= self.spk_drop_prob)
+                v = v * keep.unsqueeze(-1).to(v.dtype)
+            input_codec_embedding = input_codec_embedding.index_put(
+                (b, spk_pos), v, accumulate=False)
         input_embeddings = input_text_embedding + input_codec_embedding
 
         for i in range(1, 16):
@@ -163,6 +179,15 @@ def train():
              "用 8 位尾数累积梯度平方，lr 2e-5 下更新量有下溢风险；"
              "fp32 = fp32 权重 + autocast bf16 计算（标准混合精度），静态约 25GiB，"
              "910B2 的 64GB 吃得下，收敛更稳。显存不紧就用 fp32")
+    parser.add_argument(
+        "--spk-file", type=str, default=None,
+        help="prepare_data.py --spk_out 产出的裸 fp16 文件（[N,2048]，行与 train_jsonl 逐行对应）。"
+             "给了就在 codec 前缀里多插一格 speaker，块宽 5→6")
+    parser.add_argument(
+        "--spk-drop-prob", type=float, default=0.0,
+        help="训练时按此概率把 spk 向量整条置零，等价于「这条没有 speaker」。"
+             "默认 0 —— 此时训完的模型**必须永远给 spk**，不给就是训练中从未出现过的输入。"
+             "想让同一个 ckpt 既能纯 instruct 又能带音色，把它调到 0.1-0.3")
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum,
@@ -189,13 +214,23 @@ def train():
             if "audio_codes" in d:
                 d["audio_codes"] = np.asarray(d["audio_codes"], dtype=np.int16)
             train_data.append(d)
+    # spk 用 memmap 打开：43.5w × 2048 fp16 = 1.78GB，不进常驻内存。
+    # 行数与 jsonl 对不上会当场崩（open_spk_memmap 里查），不会静默错位。
+    spk = None
+    if args.spk_file:
+        from spk_encoder import open_spk_memmap
+
+        spk = open_spk_memmap(args.spk_file, len(train_data))
+        accelerator.print(f"speaker 向量 {spk.shape} ← {args.spk_file}"
+                          f"（drop_prob={args.spk_drop_prob}）")
     dataset = VoiceDesignTTSDataset(train_data, qwen3tts.processor, config,
                                     language=args.language,
-                                    length_bucket=args.length_bucket)
+                                    length_bucket=args.length_bucket, spk=spk)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                                   collate_fn=dataset.collate_fn)
 
-    step_module = V2TrainStep(qwen3tts.model, args.sub_talker_loss_weight)
+    step_module = V2TrainStep(qwen3tts.model, args.sub_talker_loss_weight,
+                              spk_drop_prob=args.spk_drop_prob)
     optimizer = AdamW(step_module.parameters(), lr=args.lr, weight_decay=0.01)
     model, optimizer, train_dataloader = accelerator.prepare(
         step_module, optimizer, train_dataloader
@@ -266,6 +301,11 @@ def _save(accelerator, model, args, MODEL_PATH, tag):
         # Auto→nothink 4 格）。generate_voice_design 的 language 默认是 Auto，
         # 与此不一致就是静默失配，故记进 config 供推理侧对齐。
         cfg["v2_train_language"] = args.language
+        # 训练时有没有 speaker 那一格，决定推理侧必须传什么。drop_prob=0 时
+        # 模型从没见过「没有 spk」的输入，推理不给就是静默失配（说不清哪错了，
+        # 只表现为音质/音色乱）。记进 config 供推理侧对齐。
+        cfg["v2_train_spk"] = bool(args.spk_file)
+        cfg["v2_train_spk_drop_prob"] = args.spk_drop_prob
         with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
 

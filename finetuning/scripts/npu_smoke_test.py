@@ -311,7 +311,7 @@ def s4_codes(model_path, workdir, real_jsonl=None, n_synth=8, device="npu:0"):
 # ------------------------------------------------------------ 4b 真实数据准备链路
 
 
-def s4b_pipeline(model_path, workdir, device, n=12):
+def s4b_pipeline(model_path, workdir, device, n=12, spk_model_path=None):
     """走**生产路径** prepare_v2_data.py → prepare_data.py。
 
     阶段 4 是自己造 wav 直接调 tokenizer，绕开了整个数据准备脚本。而那两个脚本
@@ -417,6 +417,11 @@ def s4b_pipeline(model_path, workdir, device, n=12):
            f"--device {device} --tokenizer_model_path "
            f"{shlex.quote(os.path.join(model_path, 'speech_tokenizer'))} "
            f"--input_jsonl {shlex.quote(raw)} --output_jsonl {shlex.quote(codes)}")
+    spk_path = None
+    if spk_model_path:
+        spk_path = os.path.join(wd, "spk.f16")
+        cmd += (f" --spk_out {shlex.quote(spk_path)} "
+                f"--spk_model_path {shlex.quote(spk_model_path)}")
     r2 = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if r2.returncode != 0:
         for line in (r2.stdout or r2.stderr or "")[-1500:].split("\n")[-15:]:
@@ -449,14 +454,26 @@ def s4b_pipeline(model_path, workdir, device, n=12):
             return fail(f"续跑（{tag}截断）后与输入不是一一对应",
                         f"得 {len(got2)} 条，应 {len(src_audio)} 条且顺序一致")
         ok(f"断点续跑正确（{tag}截断到 {keep} → 补齐 {len(got2)}，逐条对应）")
-    return codes
+        # spk 文件必须跟着 jsonl 同步截断/补齐。少一行就整体错位 ——
+        # 第 i 条的 codes 配上第 j 条的音色，训练不报错，产出的音色全是乱的。
+        if spk_path:
+            sys.path.insert(0, ft)
+            from spk_encoder import SPK_ITEMSIZE
+
+            rows_spk = os.path.getsize(spk_path) / SPK_ITEMSIZE
+            if rows_spk != len(got2):
+                return fail(f"续跑（{tag}截断）后 spk 有 {rows_spk:.1f} 行、"
+                            f"jsonl 有 {len(got2)} 行", "两者已错位")
+            ok(f"  spk 文件同步对齐到 {len(got2)} 行")
+    return (codes, spk_path)
 
 
 # ---------------------------------------------------------------- 5 序列布局
 
 
-def s5_layout(model_path, codes_jsonl, language):
-    stage(5, "序列布局（与推理侧逐格核对，纯 CPU）")
+def s5_layout(model_path, codes_jsonl, language, spk_file=None):
+    stage(5, "序列布局（与推理侧逐格核对，纯 CPU）"
+             + ("｜含 speaker 槽位" if spk_file else ""))
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     import torch
     from dataset_voicedesign import VoiceDesignTTSDataset
@@ -467,7 +484,16 @@ def s5_layout(model_path, codes_jsonl, language):
     tc = cfg.talker_config
     proc = Qwen3TTSProcessor.from_pretrained(model_path)
     rows = [json.loads(l) for l in open(codes_jsonl)][:2]
-    ds = VoiceDesignTTSDataset(rows, proc, cfg, language=language)
+    spk = None
+    if spk_file:
+        import numpy as np
+
+        n_all = sum(1 for l in open(codes_jsonl) if l.strip())
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from spk_encoder import open_spk_memmap
+
+        spk = np.asarray(open_spk_memmap(spk_file, n_all)[: len(rows)])
+    ds = VoiceDesignTTSDataset(rows, proc, cfg, language=language, spk=spk)
     items = [ds[0]] if len(ds) < 2 else [ds[0], ds[1]]   # 只有 1 条时不要 IndexError
     b = ds.collate_fn(items)
     ii, lab = b["input_ids"][0], b["codec_0_labels"][0]
@@ -485,14 +511,34 @@ def s5_layout(model_path, codes_jsonl, language):
     checks.append(("label 起点 = codec_bos 位", int(nz[0]) == bp))
     checks.append(("label 末位 = codec_eos", int(lab[int(nz[-1])]) == tc.codec_eos_token_id))
     # 对齐块紧邻在正文之前：从 codec_bos 往前数 = 正文长度 + 1(tts_eos) + nb
-    prefix_expect, _nb = ds._codec_prefix()
+    prefix_expect, _nb, _spk_rel = ds._codec_prefix()
     n_body = ds[0]["text_ids"].shape[1] - 3
     a = bp - 1 - n_body - _nb
     got = [int(ii[p, 1]) for p in range(a, a + _nb)]
-    checks.append((f"对齐块 codec 前缀逐格相符（block 宽 {_nb}，{'think' if _nb == 5 else 'nothink'} 开头）",
+    checks.append((f"对齐块 codec 前缀逐格相符（block 宽 {_nb}，{'think' if _nb in (5, 6) else 'nothink'} 开头）",
                    got == prefix_expect))
     checks.append(("instruct 段 codec_embedding_mask 为 False",
                    not bool(b["codec_embedding_mask"][0, 0, 0])))
+
+    # ---- speaker 槽位（给了 --spk 才查）----
+    if spk is not None:
+        nb_want = 6 if language.lower() != "auto" else 5
+        checks.append((f"带 spk 的块宽 = {nb_want}（比不带 spk 多一格）", _nb == nb_want))
+        checks.append(("spk 槽位夹在 think_eos 与 codec_pad 之间"
+                       "（与推理侧 cat(emb0, spk, emb1) 一致）",
+                       _spk_rel == _nb - 2))
+        # instruct 变长 → 绝对位置每条不同，不能像官方那样写死 [:, 6, :]
+        checks.append(("spk_pos 指到对齐块内的 spk 格", int(b["spk_pos"][0]) == a + _spk_rel))
+        checks.append(("spk 那格 codec_embedding_mask 为 True",
+                       bool(b["codec_embedding_mask"][0, a + _spk_rel, 0])))
+        if len(items) > 1 and ds[0]["instruct_ids"].shape[1] != ds[1]["instruct_ids"].shape[1]:
+            checks.append(("两条 instruct 不等长时 spk_pos 各不相同",
+                           int(b["spk_pos"][0]) != int(b["spk_pos"][1])))
+        checks.append(("spk_vec 与源文件逐位相同（没在 collate 里被打乱）",
+                       bool(torch.allclose(b["spk_vec"][0],
+                                           torch.tensor(spk[0], dtype=torch.float32)))))
+        checks.append(("spk 向量非全零（抽取环节没静默失败）",
+                       float(b["spk_vec"][0].abs().sum()) > 0))
     allok = True
     for name, r in checks:
         (ok if r else lambda m: fail(m))(f"{name}: {'PASS' if r else 'FAIL'}")
@@ -507,8 +553,9 @@ def s5_layout(model_path, codes_jsonl, language):
 
 
 def s6_train(model_path, codes_jsonl, workdir, attn, language, steps,
-             dtype="fp32", batch=1, bucket=64, save_every=0):
-    stage(6, f"前反向（{steps} 步，batch={batch}，bucket={bucket}）")
+             dtype="fp32", batch=1, bucket=64, save_every=0, spk_file=None):
+    stage(6, f"前反向（{steps} 步，batch={batch}，bucket={bucket}"
+             + ("，含 spk" if spk_file else "") + "）")
     ft = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out = os.path.join(workdir, "ckpt")
     # 用 sys.executable：昇腾 conda 里不保证有 "python" 这个名字，命中时
@@ -519,7 +566,9 @@ def s6_train(model_path, codes_jsonl, workdir, attn, language, steps,
            f"--output_model_path {shlex.quote(out)} --batch_size {batch} --grad_accum 1 "
            f"--num_epochs 1 --max_steps {steps} --log_every 1 "
            f"--attn {attn} --language {language} --dtype {dtype} "
-           f"--length-bucket {bucket} --save-every {save_every} 2>&1")
+           f"--length-bucket {bucket} --save-every {save_every} "
+           + (f"--spk-file {shlex.quote(spk_file)} " if spk_file else "")
+           + "2>&1")
     log(f"  $ {cmd}\n")
     import subprocess
 
@@ -669,6 +718,11 @@ def main():
                     help="跳过阶段 4b（生产数据准备链路）")
     ap.add_argument("--use-pipeline-codes", action="store_true",
                     help="后续阶段用 4b 产出的 codes，而非阶段 4 的")
+    ap.add_argument("--spk_model_path", default=None,
+                    help="Base 权重目录。给了则阶段 4b 顺带抽 speaker 向量、"
+                         "阶段 5/6 带 speaker 槽位跑（需配 --use-pipeline-codes）")
+    ap.add_argument("--spk_file", default=None,
+                    help="直接给现成的 spk 文件（配 --codes_jsonl 用），跳过抽取")
     ap.add_argument("--report", default="npu_smoke_report.txt")
     args = ap.parse_args()
 
@@ -684,7 +738,8 @@ def main():
     os.makedirs(wd, exist_ok=True)
     log(f"工作目录 {wd}\n模型 {args.model_path}\n阶段 {sorted(want)}")
 
-    state = {"codes": args.codes_jsonl, "ckpt_root": None, "ckpt": None}
+    state = {"codes": args.codes_jsonl, "ckpt_root": None, "ckpt": None,
+             "spk": args.spk_file}
     failed = []
     ran = set()
     try:
@@ -710,12 +765,20 @@ def main():
         # 与阶段 4 一起默认跑；--skip-pipeline 跳过，--use-pipeline-codes 让后续
         # 阶段改用 4b 产出的 codes（而非阶段 4 的合成数据）
         if 4 in want and not args.skip_pipeline and not args.codes_jsonl:
-            pipe_codes = s4b_pipeline(args.model_path, wd, args.device)
-            if not pipe_codes:
+            r4b = s4b_pipeline(args.model_path, wd, args.device,
+                               spk_model_path=args.spk_model_path)
+            if not r4b:
                 failed.append("4b")
                 raise SystemExit
+            pipe_codes, pipe_spk = r4b
             if args.use_pipeline_codes:
                 state["codes"] = pipe_codes
+                # spk 只能来自 4b —— 阶段 4 是合成 wav 直接调 tokenizer，不抽 spk。
+                # 所以 --spk_model_path 必须配 --use-pipeline-codes 才有意义。
+                state["spk"] = pipe_spk
+            elif pipe_spk:
+                warn("抽了 spk 但没给 --use-pipeline-codes，"
+                     "后续阶段用的是阶段 4 的合成 codes，spk 不会被使用")
         if 4 in want:
             ran.add(4)   # 给了 --codes_jsonl 也视为已满足（用户自带产物）
             # 注意 not (use_pipeline_codes and state["codes"])：4b 在上面已经把
@@ -730,14 +793,15 @@ def main():
                     raise SystemExit
         if 5 in want and state["codes"]:
             ran.add(5)
-            if not s5_layout(args.model_path, state["codes"], args.language):
+            if not s5_layout(args.model_path, state["codes"], args.language,
+                             spk_file=state["spk"]):
                 failed.append(5)
         if 6 in want and state["codes"]:
             ran.add(6)
             state["ckpt_root"] = s6_train(args.model_path, state["codes"], wd,
                                           args.attn, args.language, args.steps,
                                           args.dtype, args.batch, args.bucket,
-                                          args.save_every)
+                                          args.save_every, spk_file=state["spk"])
             if not state["ckpt_root"]:
                 failed.append(6)
                 raise SystemExit

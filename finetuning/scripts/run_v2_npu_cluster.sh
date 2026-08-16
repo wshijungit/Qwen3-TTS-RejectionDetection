@@ -69,6 +69,12 @@ DTYPE=${DTYPE:-fp32}
 SAVE_EVERY=${SAVE_EVERY:-500}
 # 序列长度分桶：昇腾按形状编译算子，分桶让编译结果跨 step 复用（NPU 实测省 ~13%）
 LENGTH_BUCKET=${LENGTH_BUCKET:-64}
+# speaker 向量。SPK_MODEL_PATH 必须指向 **Base** 权重 —— speaker_encoder
+# 只在 tts_model_type=base 里有，VoiceDesign/CustomVoice 都是 0 张量。
+# 两个都留空 = 不带 speaker 槽位，行为与加 spk 之前完全一致。
+SPK_FILE=${SPK_FILE:-}
+SPK_MODEL_PATH=${SPK_MODEL_PATH:-}
+SPK_DROP_PROB=${SPK_DROP_PROB:-0}
 
 LOGDIR=${LOGDIR:-${WORK_ROOT}/logs}
 mkdir -p "$OUTPUT_DIR" "$LOGDIR"
@@ -82,6 +88,7 @@ echo "  训练数据:    $TRAIN_JSONL"
 echo "  输出:        $OUTPUT_DIR"
 echo "  全局 batch:  $((BATCH_SIZE * GRAD_ACCUM * WORLD))    attn=$ATTN  dtype=$DTYPE"
 echo "  save_every:  $SAVE_EVERY    length_bucket: $LENGTH_BUCKET"
+echo "  speaker:     ${SPK_FILE:-（不用）}${SPK_FILE:+  drop_prob=$SPK_DROP_PROB}"
 echo
 
 npu_preflight "$PY"
@@ -89,6 +96,13 @@ npu_preflight "$PY"
 for p in "$MODEL_PATH" "$TRAIN_JSONL"; do
     [ -e "$p" ] || { echo "❌ 路径不存在: $p" >&2; exit 1; }
 done
+
+# 集群版不做数据准备（TRAIN_JSONL 必须已存在），spk 文件同理 —— 先在
+# debug 机上跑 prepare_data.py --spk_out 抽好再上集群
+if [ -n "$SPK_FILE" ] && [ ! -f "$SPK_FILE" ]; then
+    echo "❌ 给了 SPK_FILE 但文件不存在: $SPK_FILE（先用 prepare_data.py --spk_out 抽）" >&2
+    exit 1
+fi
 
 cd "$FT_DIR"
 
@@ -111,6 +125,7 @@ cd "$FT_DIR"
     --dtype "$DTYPE" \
     --save-every "$SAVE_EVERY" \
     --length-bucket "$LENGTH_BUCKET" \
+    ${SPK_FILE:+--spk-file "$SPK_FILE" --spk-drop-prob "$SPK_DROP_PROB"} \
     --log_every 10 2>&1 | tee "$LOG"
 
 rc=${PIPESTATUS[0]}

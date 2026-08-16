@@ -17,6 +17,11 @@
 import argparse
 import json
 import os
+import sys
+
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # 同目录的 spk_encoder
 
 from qwen_tts import Qwen3TTSTokenizer
 
@@ -29,7 +34,16 @@ def main():
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     parser.add_argument("--input_jsonl", type=str, required=True)
     parser.add_argument("--output_jsonl", type=str, required=True)
+    # ---- speaker embedding（可选；给了 --spk_out 才抽）----
+    # 与 audio_codes 同一遍抽，**续跑时两者必须同步截断**，否则第 i 行的 codes
+    # 会配上第 j 条的音色，且训练时看不出任何异常。
+    parser.add_argument("--spk_out", type=str, default=None,
+                        help="speaker 向量落盘路径（裸 fp16，每行 2048 维）。不给则不抽")
+    parser.add_argument("--spk_model_path", type=str, default=None,
+                        help="Base 权重目录 —— speaker_encoder 只在 tts_model_type=base 里有")
     args = parser.parse_args()
+    if args.spk_out and not args.spk_model_path:
+        raise SystemExit("--spk_out 需要同时给 --spk_model_path（指向 Base 权重）")
 
     # 不用 device_map：torch 2.1 + torch_npu 上 meta 快速加载路径会炸
     # （param[...] → torch.cuda._lazy_init → "Torch not compiled with CUDA enabled"），
@@ -79,6 +93,23 @@ def main():
             done = sum(1 for l in f if l.strip())
         if done:
             print(f"续跑：已有 {done} 行，跳过", flush=True)
+    # spk 文件必须跟着 jsonl 一起截断到 done 行。少截/多截都会让 codes 与音色
+    # 整体错位 —— 训练不报错，只是每条音频配了别人的音色。
+    if args.spk_out and os.path.exists(args.spk_out):
+        from spk_encoder import SPK_ITEMSIZE
+
+        want = done * SPK_ITEMSIZE
+        cur = os.path.getsize(args.spk_out)
+        if cur < want:
+            # truncate 到更大的值会**用 0 补齐**，静默产出一批全零音色向量。
+            # 正常流程里 spk 先写、jsonl 后写，spk 只可能多不可能少。
+            raise SystemExit(
+                f"{args.spk_out} 只有 {cur / SPK_ITEMSIZE:.1f} 行，少于 jsonl 的 {done} 行。"
+                f"两者已错位，删掉 {args.spk_out} 和 {args.output_jsonl} 重抽。")
+        if cur > want:
+            with open(args.spk_out, "rb+") as f:
+                f.truncate(want)
+            print(f"续跑：spk 文件 {cur // SPK_ITEMSIZE} 行 → 截到 {done} 行", flush=True)
     if done > len(total_lines):
         raise SystemExit(
             f"输出已有 {done} 行 > 输入 {len(total_lines)} 行 —— 输入文件很可能换过，"
@@ -87,7 +118,30 @@ def main():
         print("已全部完成"); return
     total_lines = total_lines[done:]
 
-    def flush(fh, lines, audios):
+    spk_enc = None
+    if args.spk_out:
+        from spk_encoder import SPK_SR, extract_spk, load_speaker_encoder
+
+        spk_enc = load_speaker_encoder(args.spk_model_path, device=args.device)
+        print(f"已加载 speaker_encoder（{args.spk_model_path}）", flush=True)
+
+    def flush(fh, lines, audios, sfh=None):
+        # spk 先算：它比 tokenizer.encode 更容易在坏音频上崩，先崩掉就不会留下
+        # 「codes 写了、spk 没写」的错位状态。写盘顺序同理 —— spk 先落、jsonl 后落，
+        # 崩在中间时 spk 只会多不会少，续跑截断逻辑才成立。
+        if spk_enc is not None:
+            import librosa
+
+            vecs = []
+            for p in audios:
+                wav, _ = librosa.load(p, sr=SPK_SR, mono=True)
+                vecs.append(extract_spk(spk_enc, wav, SPK_SR, device=args.device))
+            v = torch.stack(vecs).to(torch.float16).numpy()
+            if v.shape[1] != 2048:
+                raise RuntimeError(f"speaker 向量维度 {v.shape[1]} != 2048")
+            sfh.write(v.tobytes())
+            sfh.flush()
+
         enc = tokenizer_12hz.encode(audios)
         # py3.9 没有 zip(strict=True)。若 encode 返回条数少于输入（异常音频等），
         # 那些行会静默消失，而续跑是按行数跳过的 —— 一旦少一行，之后的
@@ -109,22 +163,27 @@ def main():
         lines.clear()
         audios.clear()
 
+    import contextlib
+
     batch_lines, batch_audios = [], []
     n, nb = done, 0
-    with open(args.output_jsonl, "a", encoding="utf-8") as fh:
+    with contextlib.ExitStack() as st:
+        fh = st.enter_context(open(args.output_jsonl, "a", encoding="utf-8"))
+        sfh = st.enter_context(open(args.spk_out, "ab")) if args.spk_out else None
         for line in total_lines:
             batch_lines.append(line)
             batch_audios.append(line["audio"])
             if len(batch_lines) >= BATCH_INFER_NUM:
-                flush(fh, batch_lines, batch_audios)
+                flush(fh, batch_lines, batch_audios, sfh)
                 n += BATCH_INFER_NUM
                 nb += 1
                 if nb % 50 == 0:          # 按 batch 计数，不依赖 n 是否为 32 的倍数
                     print(f"  {n}/{done + len(total_lines)}", flush=True)
         if batch_audios:
             n += len(batch_audios)
-            flush(fh, batch_lines, batch_audios)
-    print(f"完成 {n} 行 → {args.output_jsonl}")
+            flush(fh, batch_lines, batch_audios, sfh)
+    print(f"完成 {n} 行 → {args.output_jsonl}"
+          + (f"，speaker 向量 → {args.spk_out}" if args.spk_out else ""))
 
 
 if __name__ == "__main__":

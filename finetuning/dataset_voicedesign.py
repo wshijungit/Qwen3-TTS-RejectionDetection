@@ -21,21 +21,33 @@
 1. **instruct 前缀**：instruct 经 `<|im_start|>user\\n{ins}<|im_end|>\\n` 包装后
    tokenize，作为变长前缀排在最前，只占文本通道，codec 通道留空
    （推理侧 :2076-2080 就是把它 embed 后 append 到 talker 输入序列最前）。
-2. **无 speaker 槽位**：VoiceDesign 的 `speaker_embed is None`（:2165-2171），
-   codec 前缀里没有 speaker 那一格。官方 dataset.py 的第 6 号槽和
-   `codec_embedding_mask[i,6]=False` 都要去掉。
-3. **无 ref_audio**：不做音色克隆，不抽 ref_mel，不跑 speaker_encoder。
+2. **speaker 槽位可选**：不给 `spk` 时沿用 VoiceDesign 原本的
+   `speaker_embed is None` 路径（:2213-2215），codec 前缀里没有 speaker 那一格。
+   给了 `spk` 则在 head 与 `[codec_pad, codec_bos]` 之间插一格，与推理侧的
+   `cat(emb0, speaker_embed.view(1,1,-1), emb1)`（:2216-2218）逐格对齐，块宽 5→6。
+   **该格的 embedding 是被整格覆盖的，不是相加**（官方 sft_12hz.py:91 同）。
+   官方 dataset.py 把位置写死成 `[:, 6, :]`，这里不行 —— instruct 是变长前缀，
+   每条样本的绝对位置都不同，故 collate 额外吐 `spk_pos`。
+3. **无 ref_audio**：不做音色克隆，也不在训练图里跑 speaker_encoder ——
+   spk 向量在数据准备阶段用 Base 的 encoder 离线抽好（见 spk_encoder.py）。
+   官方那行本就是 `.detach()`，encoder 全程冻结，离线与在线等价。
 4. **带 language 的 codec 前缀**：语言非 Auto 时推理侧走
    `[think, think_bos, language_id, think_eos]`（:2141-2147），而不是 Auto 的
    `[nothink, think_bos, think_eos]`。两者加上 `[codec_pad, codec_bos]` 后
    分别是 6/5 长，去掉末位 codec_bos 参与对齐，故块宽 5/4。
 
-序列布局（block 宽度 nb = 5 带语言 / 4 用 Auto）：
+序列布局（block 宽度 nb：带语言 5、带语言+spk 6、Auto 4、Auto+spk 5）：
 
     位置    0 .. n_ins-1     | n_ins .. +3   | +nb 个对齐槽        | 文本 ...        | 音频码 ...
     文本    instruct tokens  | role(3 token) | pad×(nb-1), bos     | text, eos, pad  | pad
-    codec   (空, mask off)   | (空, mask off)| think/lang/pad 等   | codec_pad, bos  | codec_0
+    codec   (空, mask off)   | (空, mask off)| think/lang/spk/pad  | codec_pad, bos  | codec_0
+
+对齐块的 codec 逐格（带语言 + spk 的情况）：
+
+    think, think_bos, lang, think_eos, [spk], codec_pad
+                                        ^ 这一格的 embedding 被 spk 向量整格覆盖
 """
+import numpy as np
 import torch
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from torch.utils.data import Dataset
@@ -57,13 +69,18 @@ LENGTH_BUCKET = 64
 
 class VoiceDesignTTSDataset(Dataset):
     def __init__(self, data_list, processor, config: Qwen3TTSConfig, language="Chinese",
-                 lag_num=-1, length_bucket=LENGTH_BUCKET):
+                 lag_num=-1, length_bucket=LENGTH_BUCKET, spk=None):
         self.data_list = data_list
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
         self.language = language
         self.length_bucket = max(1, int(length_bucket))
+        # spk: None 或 [N, 2048] 的 memmap/数组，行号与 data_list 一一对应。
+        # 给了就在 codec 前缀里多插一格 speaker（块宽 5→6）。
+        self.spk = spk
+        if spk is not None and len(spk) != len(data_list):
+            raise ValueError(f"spk 有 {len(spk)} 行，data_list 有 {len(data_list)} 条，必须逐行对应")
 
     def __len__(self):
         return len(self.data_list)
@@ -82,7 +99,11 @@ class VoiceDesignTTSDataset(Dataset):
         return ids.unsqueeze(0) if ids.dim() == 1 else ids
 
     def _codec_prefix(self):
-        """返回 (codec 前缀 token 列表, 块宽 nb)。与推理侧 :2135-2147 一致。"""
+        """返回 (codec 前缀 token 列表, 块宽 nb, speaker 相对位置)。
+
+        与推理侧 :2180-2218 一致。speaker 那一格夹在 head 和 [codec_pad, codec_bos]
+        中间：`cat(emb0, speaker_embed.view(1,1,-1), emb1)`。
+        """
         tc = self.config.talker_config
         lang = (self.language or "auto").lower()
         if lang == "auto":
@@ -96,8 +117,14 @@ class VoiceDesignTTSDataset(Dataset):
                 tc.codec_language_id[lang],
                 tc.codec_think_eos_id,
             ]
+        # speaker 槽位占的 token id 无所谓 —— 它的 embedding 会被整格**覆盖**成
+        # spk 向量（官方 sft_12hz.py:91 的 input_codec_embedding[:, 6, :] = ... 也是
+        # 赋值而非相加）。填 codec_pad 只是为了不落在词表外。
+        spk_rel = len(head) if self.spk is not None else -1
+        mid = [tc.codec_pad_id] if self.spk is not None else []
         # 推理侧把 [codec_pad, codec_bos] 接在后面再丢掉末位 codec_bos 参与对齐
-        return head + [tc.codec_pad_id], len(head) + 1
+        prefix = head + mid + [tc.codec_pad_id]
+        return prefix, len(prefix), spk_rel
 
     def __getitem__(self, idx):
         item = self.data_list[idx]
@@ -115,16 +142,20 @@ class VoiceDesignTTSDataset(Dataset):
             else torch.zeros((1, 0), dtype=torch.long)
         )
 
-        return {
+        out = {
             "text_ids": text_ids,          # 1, t   (role 3 token + 正文)
             "instruct_ids": instruct_ids,  # 1, n   (可为空)
             "audio_codes": audio_codes,    # t, 16
         }
+        if self.spk is not None:
+            # memmap 的行是 fp16，转 float32 交给上层（autocast 会再降回 bf16）
+            out["spk"] = torch.from_numpy(np.asarray(self.spk[idx], dtype=np.float32))
+        return out
 
     def collate_fn(self, batch):
         assert self.lag_num == -1
         tc = self.config.talker_config
-        codec_prefix, nb = self._codec_prefix()
+        codec_prefix, nb, spk_rel = self._codec_prefix()
 
         lens = [
             b["instruct_ids"].shape[1] + b["text_ids"].shape[1] + b["audio_codes"].shape[0]
@@ -142,6 +173,10 @@ class VoiceDesignTTSDataset(Dataset):
         codec_mask = torch.zeros((b_, t), dtype=torch.bool)
         attention_mask = torch.zeros((b_, t), dtype=torch.long)
         codec_0_labels = torch.full((b_, t), -100, dtype=torch.long)
+        # instruct 是变长前缀，speaker 那一格的绝对位置**每条样本都不同**，
+        # 不能像官方 sft_12hz.py 那样写死 [:, 6, :]。
+        spk_pos = torch.zeros((b_,), dtype=torch.long) if spk_rel >= 0 else None
+        spk_vec = torch.zeros((b_, 2048), dtype=torch.float32) if spk_rel >= 0 else None
 
         for i, data in enumerate(batch):
             ins_ids = data["instruct_ids"]
@@ -168,6 +203,9 @@ class VoiceDesignTTSDataset(Dataset):
             input_ids[i, a:a + nb - 1, 0] = self.config.tts_pad_token_id
             input_ids[i, a + nb - 1, 0] = self.config.tts_bos_token_id
             input_ids[i, a:a + nb, 1] = torch.tensor(codec_prefix, dtype=torch.long)
+            if spk_rel >= 0:
+                spk_pos[i] = a + spk_rel
+                spk_vec[i] = data["spk"]
 
             # ---- 4. 正文 + tts_eos，codec 侧**全部** codec_pad（含 eos 那格）----
             s = a + nb                      # 正文起点
@@ -211,7 +249,7 @@ class VoiceDesignTTSDataset(Dataset):
             codec_mask[i, c:c + n_cod] = True
             attention_mask[i, :end] = True
 
-        return {
+        out = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "text_embedding_mask": text_embedding_mask.unsqueeze(-1),
@@ -220,3 +258,7 @@ class VoiceDesignTTSDataset(Dataset):
             "codec_ids": codec_ids,
             "codec_mask": codec_mask,
         }
+        if spk_rel >= 0:
+            out["spk_pos"] = spk_pos
+            out["spk_vec"] = spk_vec
+        return out

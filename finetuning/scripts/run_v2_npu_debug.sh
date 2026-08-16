@@ -61,6 +61,12 @@ DTYPE=${DTYPE:-fp32}
 SAVE_EVERY=${SAVE_EVERY:-500}
 # 序列长度分桶：昇腾按形状编译算子，分桶让编译结果跨 step 复用（NPU 实测省 ~13%）
 LENGTH_BUCKET=${LENGTH_BUCKET:-64}
+# speaker 向量。SPK_MODEL_PATH 必须指向 **Base** 权重 —— speaker_encoder
+# 只在 tts_model_type=base 里有，VoiceDesign/CustomVoice 都是 0 张量。
+# 两个都留空 = 不带 speaker 槽位，行为与加 spk 之前完全一致。
+SPK_FILE=${SPK_FILE:-}
+SPK_MODEL_PATH=${SPK_MODEL_PATH:-}
+SPK_DROP_PROB=${SPK_DROP_PROB:-0}
 
 # 必须绝对路径：下面会 cd 到 $FT_DIR，相对路径的 ./logs 会漂到别处，
 # 叠加 set -o pipefail 会让 tee 失败直接终止脚本
@@ -75,6 +81,7 @@ echo "  训练数据:    $TRAIN_JSONL"
 echo "  输出:        $OUTPUT_DIR"
 echo "  bs/accum/lr: $BATCH_SIZE / $GRAD_ACCUM / $LR    attn=$ATTN  dtype=$DTYPE  language=$LANGUAGE"
 echo "  save_every:  $SAVE_EVERY    length_bucket: $LENGTH_BUCKET"
+echo "  speaker:     ${SPK_FILE:-（不用）}${SPK_FILE:+  drop_prob=$SPK_DROP_PROB}"
 echo
 
 npu_preflight "$PY"
@@ -87,6 +94,14 @@ if [ "${SKIP_PREPARE:-0}" = "1" ] && [ ! -f "$TRAIN_JSONL" ]; then
     echo "❌ SKIP_PREPARE=1 但训练数据不存在: $TRAIN_JSONL" >&2; exit 1
 fi
 
+# SPK_FILE 要抽就必须给 Base 权重；只给一个是配置错误，早崩比训到一半崩好
+if [ -n "$SPK_FILE" ] && [ "${SKIP_PREPARE:-0}" != "1" ] && [ -z "$SPK_MODEL_PATH" ]; then
+    echo "❌ 给了 SPK_FILE 就必须给 SPK_MODEL_PATH（指向 Base 权重）" >&2; exit 1
+fi
+if [ -n "$SPK_FILE" ] && [ "${SKIP_PREPARE:-0}" = "1" ] && [ ! -f "$SPK_FILE" ]; then
+    echo "❌ SKIP_PREPARE=1 但 spk 文件不存在: $SPK_FILE" >&2; exit 1
+fi
+
 cd "$FT_DIR"
 
 # ---- 抽 audio_codes（NPU 上 --device 必须显式传 npu:N，默认值是 cuda:0）----
@@ -97,7 +112,8 @@ if [ "${SKIP_PREPARE:-0}" != "1" ]; then
         --device "$DEVICE" \
         --tokenizer_model_path "$TOKENIZER_PATH" \
         --input_jsonl "$RAW_JSONL" \
-        --output_jsonl "$TRAIN_JSONL" 2>&1 | tee -a "$LOG"
+        --output_jsonl "$TRAIN_JSONL" \
+        ${SPK_FILE:+--spk_out "$SPK_FILE" --spk_model_path "$SPK_MODEL_PATH"} 2>&1 | tee -a "$LOG"
 fi
 
 echo ">>> 训练"
@@ -115,6 +131,7 @@ echo ">>> 训练"
     --save-every "$SAVE_EVERY" \
     --length-bucket "$LENGTH_BUCKET" \
     --max_steps "$MAX_STEPS" \
+    ${SPK_FILE:+--spk-file "$SPK_FILE" --spk-drop-prob "$SPK_DROP_PROB"} \
     --log_every 1 2>&1 | tee -a "$LOG"
 
 if [ ${PIPESTATUS[0]} -eq 0 ]; then
