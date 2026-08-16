@@ -160,8 +160,9 @@ bash run_v2_npu_cluster.sh
 | 用途 | debug 机 | 集群 |
 |---|---|---|
 | 模型 | `/home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | `/opt/huawei/quoteModel/...` |
-| 数据 | `/home/ma-user/work/dataset/duplex_whj_data/v2/train_{raw,codes}.jsonl` | `/opt/huawei/dataset/...` |
-| 输出 | `/home/ma-user/work/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/debug` | `/opt/huawei/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/${RUN_NAME:-v1}` |
+| spk | `/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp/qwen3_spk_emb/spk.f16` | `/opt/huawei/dataset/wsj-mimo-data/qwen_tts_exp/qwen3_spk_emb/spk.f16` |
+| 数据 | `/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp/data/v2/train_{raw,codes}.jsonl` | `/opt/huawei/dataset/wsj-mimo-data/qwen_tts_exp/data/v2/...` |
+| 输出 | `/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp/runs/debug` | `/opt/huawei/dataset/wsj-mimo-data/qwen_tts_exp/runs/${RUN_NAME:-v1}` |
 
 覆盖一律传**绝对路径**：脚本里 `RAW_JSONL/TRAIN_JSONL` 会 realpath，相对路径按脚本
 启动目录解析，容易漂。
@@ -569,6 +570,7 @@ loss 从 3.6 降到 1.1，**确认在真降不是抖**——bf16 之外的收敛
 ```bash
 S=/home/ma-user/work/dataset/stc_data/dataset/cabin_duplex_data_artif
 W=/home/ma-user/work/dataset/duplex_whj_data
+E=/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp
 cd finetuning
 
 python prepare_v2_data.py \
@@ -657,13 +659,14 @@ npu_env.sh 后 TBE 崩溃消失，见命令注释）、阶段 5 七项全 PASS�
 ```bash
 S=/home/ma-user/work/dataset/stc_data/dataset/cabin_duplex_data_artif
 W=/home/ma-user/work/dataset/duplex_whj_data
+E=/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp
 cd finetuning
 
 python prepare_v2_data.py \
   --dataset cc0601 $S/yibuapi_outputs/CC_new_0601_0630/setup1/gemini-3.5-flash/setup1_exp05.jsonl  $W/CC_new_0601_0630_wavs \
   --dataset cc0701 $S/yibuapi_outputs/CC_new_0701_0730/setup1/gemini-3.5-flash/setup1_exp05.jsonl  $W/CC_new_0701_0730_wavs \
   --dataset car05  $S/yibuapi_outputs/car_all_0415_0424/setup1/gemini-3.5-flash/setup1_exp05.jsonl $W/car_all_0415_0424_wavs \
-  --out-dir $W/v2 --wav-out-dir $W/v2/wav \
+  --out-dir $E/data/v2 --wav-out-dir $E/data/v2/wav \
   --workers 32 --skip-existing
 ```
 
@@ -683,7 +686,7 @@ VAD 数小时，trimmed wav 约 50-60GB。`--skip-existing` 可断点续跑（VA
 ```bash
 python prepare_data.py --device npu:0 \
   --tokenizer_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign/speech_tokenizer \
-  --input_jsonl $W/v2/train_raw.jsonl --output_jsonl $W/v2/train_codes.jsonl
+  --input_jsonl $E/data/v2/train_raw.jsonl --output_jsonl $E/data/v2/train_codes.jsonl
 ```
 
 **这一步现在支持断点续跑**（逐 batch 追加写，重启按已写行数跳过），
@@ -697,8 +700,8 @@ python prepare_data.py --device npu:0 \
 ```bash
 SPK_MEL_THREADS=4 \
 python prepare_data.py --spk-only --device npu:0 \
-  --input_jsonl $W/v2/train_codes.jsonl \
-  --spk_out /home/ma-user/work/dataset/wsj-mimo-data/qwen3_spk_emb/spk.f16 \
+  --input_jsonl $E/data/v2/train_codes.jsonl \
+  --spk_out /home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp/qwen3_spk_emb/spk.f16 \
   --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base
 ```
 
@@ -723,7 +726,7 @@ bash run_v2_npu_debug.sh
 而它现在带着 `--spk_out`（`SPK_FILE` 有默认值），面对「codes 已全抽完、
 spk 也已存在」会因行数检查直接退出。codes 和 spk 都齐了，本来也不需要再准备。
 
-脚本默认 `SPK_FILE=/home/ma-user/work/dataset/wsj-mimo-data/qwen3_spk_emb/spk.f16`，
+脚本默认 `SPK_FILE=/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp/qwen3_spk_emb/spk.f16`，
 所以**不用显式传**；想跑不带 speaker 的对照组则显式置空：`SPK_FILE= bash ...`。
 
 启动脚本已透传 `SAVE_EVERY`（默认 **500** 步）与 `LENGTH_BUCKET`（默认 64）。
@@ -747,12 +750,12 @@ NPU 的 HCCL 路径上还没验过。
 唯一方式是拿最近的 step checkpoint 当新的初始权重重启：
 
 ```bash
-E=/home/ma-user/work/quoteModel/duplex_whj_exp/v2_single_text_turn_tts
-ls $E/debug          # 先看最近的是哪个 checkpoint-stepNNNN
+E=/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp
+ls $E/runs/debug          # 先看最近的是哪个 checkpoint-stepNNNN
 
 cd scripts
-MODEL_PATH=$E/debug/checkpoint-step54000 \
-OUTPUT_DIR=$E/debug_resume1 \
+MODEL_PATH=$E/runs/debug/checkpoint-step54000 \
+OUTPUT_DIR=$E/runs/debug_resume1 \
 SKIP_PREPARE=1 BATCH_SIZE=8 GRAD_ACCUM=1 EPOCHS=1 \
 bash run_v2_npu_debug.sh
 ```
@@ -1299,7 +1302,8 @@ print('enc_dim =', c['speaker_encoder_config']['enc_dim'], '（必须是 2048）
 #### (3) 跑法与「报错了怎么办」
 
 ```bash
-SPK_MEL_THREADS=<上面(1)拿到的值> python prepare_data.py --spk-only --device npu:0   --input_jsonl $W/v2/train_codes.jsonl   --spk_out $W/v2/spk.f16   --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base
+E=/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp
+SPK_MEL_THREADS=<上面(1)拿到的值> python prepare_data.py --spk-only --device npu:0   --input_jsonl $E/data/v2/train_codes.jsonl   --spk_out $E/qwen3_spk_emb/spk.f16   --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base
 ```
 
 每 2000 条打一次 `ms/条` 和剩余时间。中途崩了**重跑同一条命令**即可续跑。
@@ -1320,10 +1324,10 @@ SPK_MEL_THREADS=<上面(1)拿到的值> python prepare_data.py --spk-only --devi
 ```bash
 python -c "
 import os,json,numpy as np
-n=sum(1 for l in open('$W/v2/train_codes.jsonl') if l.strip())
-sz=os.path.getsize('$W/v2/spk.f16')
+n=sum(1 for l in open('$E/data/v2/train_codes.jsonl') if l.strip())
+sz=os.path.getsize('$E/qwen3_spk_emb/spk.f16')
 print('codes 行数', n, '| spk 行数', sz//4096, '| 一致:', sz==n*4096)
-v=np.memmap('$W/v2/spk.f16',dtype=np.float16,mode='r',shape=(n,2048)).astype(np.float32)
+v=np.memmap('$E/qwen3_spk_emb/spk.f16',dtype=np.float16,mode='r',shape=(n,2048)).astype(np.float32)
 print('全零行数:', int((np.abs(v).sum(1)==0).sum()), '（应为 0）')
 print('NaN/Inf 行数:', int((~np.isfinite(v)).any(1).sum()), '（应为 0）')
 V=v/np.linalg.norm(v,axis=1,keepdims=True); i=np.random.default_rng(0).choice(n,min(n,2000),replace=False)
@@ -1360,7 +1364,7 @@ spk 有两种抽法，**产出逐位相同**（已验）：
 比训完 19-21 小时才发现音色那一格没学到要划算得多：
 
 ```bash
-head -256 $W/v2/train_codes.jsonl > /tmp/real256_codes.jsonl
+head -256 $E/data/v2/train_codes.jsonl > /tmp/real256_codes.jsonl
 python prepare_data.py --spk-only --device npu:0   --input_jsonl /tmp/real256_codes.jsonl --spk_out /tmp/real256_spk.f16   --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base
 cd scripts && python npu_smoke_test.py --model_path $MDL   --codes_jsonl /tmp/real256_codes.jsonl --spk_file /tmp/real256_spk.f16   --stages 5-8 --steps 200
 ```
@@ -1444,8 +1448,9 @@ think, think_bos, lang, think_eos, [spk], codec_pad
 ### 17.4 怎么跑
 
 ```bash
+E=/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp
 # 抽码时顺带抽 spk（Base 权重路径见 17.6 的问题 2）
-SPK_FILE=$W/v2/spk.f16 \
+SPK_FILE=$E/qwen3_spk_emb/spk.f16 \
 SPK_MODEL_PATH=$WORK_ROOT/model/Qwen3-TTS-12Hz-1.7B-Base \
 bash run_v2_npu_debug.sh
 

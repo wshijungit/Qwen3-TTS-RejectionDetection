@@ -1,5 +1,5 @@
 #!/bin/bash
-# V2 VoiceDesign 微调 —— 本机 debug 版（单卡 910B2 / 64GB）。
+# V2 VoiceDesign 微调 —— 本机 debug 版（单卡 910B1 / 64GB）。
 #
 # 1.7B 全参微调静态显存：--dtype fp32（默认）约 25GiB，--dtype bf16 约 12.7GiB
 # （实测 accelerate 的 bf16 下参数/梯度/Adam 动量全是 bf16）。64GB 单卡装得下 ——
@@ -38,13 +38,13 @@ export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0}
 #   集群    WORK_ROOT=/opt/huawei
 #   模型 $WORK_ROOT/model|quoteModel · 数据 $WORK_ROOT/dataset · 输出 $WORK_ROOT/quoteModel
 WORK_ROOT=${WORK_ROOT:-/home/ma-user/work}
-DATA_ROOT=${DATA_ROOT:-$WORK_ROOT/dataset/duplex_whj_data/v2}
+DATA_ROOT=${DATA_ROOT:-/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp/data/v2}
 
 MODEL_PATH=${MODEL_PATH:-$WORK_ROOT/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign}
 TOKENIZER_PATH=${TOKENIZER_PATH:-${MODEL_PATH}/speech_tokenizer}
 RAW_JSONL=$(realpath -m "${RAW_JSONL:-$DATA_ROOT/train_raw.jsonl}")
 TRAIN_JSONL=$(realpath -m "${TRAIN_JSONL:-$DATA_ROOT/train_codes.jsonl}")
-OUTPUT_DIR=$(realpath -m "${OUTPUT_DIR:-$WORK_ROOT/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/debug}")
+OUTPUT_DIR=$(realpath -m "${OUTPUT_DIR:-/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp/runs/debug}")
 
 BATCH_SIZE=${BATCH_SIZE:-2}
 GRAD_ACCUM=${GRAD_ACCUM:-4}
@@ -65,7 +65,7 @@ LENGTH_BUCKET=${LENGTH_BUCKET:-64}
 # 只在 tts_model_type=base 里有，VoiceDesign/CustomVoice 都是 0 张量。
 # 默认开：spk 文件放 qwen3_spk_emb/（1.78GB，行序与 train_codes.jsonl 对齐）。
 # 两个都留空 = 不带 speaker 槽位，行为与加 spk 之前完全一致。
-SPK_FILE=${SPK_FILE:-/home/ma-user/work/dataset/wsj-mimo-data/qwen3_spk_emb/spk.f16}
+SPK_FILE=${SPK_FILE:-/home/ma-user/work/dataset/wsj-mimo-data/qwen_tts_exp/qwen3_spk_emb/spk.f16}
 SPK_MODEL_PATH=${SPK_MODEL_PATH:-/home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base}
 SPK_DROP_PROB=${SPK_DROP_PROB:-0}
 

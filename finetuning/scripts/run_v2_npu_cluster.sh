@@ -54,8 +54,8 @@ MASTER_PORT=${MASTER_PORT:-6411}   # 参考仓库同值
 netstat -tuln | grep ${MASTER_PORT} || echo "端口 ${MASTER_PORT} 空闲"
 
 MODEL_PATH=${MODEL_PATH:-${WORK_ROOT}/quoteModel/Qwen3-TTS-12Hz-1.7B-VoiceDesign}
-TRAIN_JSONL=${TRAIN_JSONL:-${WORK_ROOT}/dataset/duplex_whj_data/v2/train_codes.jsonl}
-OUTPUT_DIR=${OUTPUT_DIR:-${WORK_ROOT}/quoteModel/duplex_whj_exp/v2_single_text_turn_tts/${RUN_NAME:-v1}}
+TRAIN_JSONL=${TRAIN_JSONL:-${WORK_ROOT}/dataset/wsj-mimo-data/qwen_tts_exp/data/v2/train_codes.jsonl}
+OUTPUT_DIR=${OUTPUT_DIR:-${WORK_ROOT}/dataset/wsj-mimo-data/qwen_tts_exp/runs/${RUN_NAME:-v1}}
 
 BATCH_SIZE=${BATCH_SIZE:-4}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
@@ -73,7 +73,7 @@ LENGTH_BUCKET=${LENGTH_BUCKET:-64}
 # 只在 tts_model_type=base 里有，VoiceDesign/CustomVoice 都是 0 张量。
 # 默认开：spk 文件放 qwen3_spk_emb/（1.78GB，行序与 train_codes.jsonl 对齐）。
 # 两个都留空 = 不带 speaker 槽位，行为与加 spk 之前完全一致。
-SPK_FILE=${SPK_FILE:-${WORK_ROOT}/dataset/wsj-mimo-data/qwen3_spk_emb/spk.f16}
+SPK_FILE=${SPK_FILE:-${WORK_ROOT}/dataset/wsj-mimo-data/qwen_tts_exp/qwen3_spk_emb/spk.f16}
 SPK_MODEL_PATH=${SPK_MODEL_PATH:-${WORK_ROOT}/quoteModel/Qwen3-TTS-12Hz-1.7B-Base}
 SPK_DROP_PROB=${SPK_DROP_PROB:-0}
 
