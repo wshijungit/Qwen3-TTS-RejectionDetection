@@ -67,6 +67,19 @@ def load_speaker_encoder(base_model_path, device="cpu", dtype=torch.float32):
     return enc
 
 
+# mel 是在 **CPU** 上算的（内含 torch.stft），而 torch 默认把机器上所有核都
+# 拿来跑 —— 本机 192 核，对一段 2-4 秒音频的小 STFT 来说纯粹是线程调度开销。
+# 实测（32 条 1.5-4.5s）：
+#     num_threads=192  29.7 ms/条      ← 默认
+#     num_threads=1     2.5 ms/条      ← 快 12 倍
+# 43.5w 条就是 3.6h vs 0.3h 的差别。线程池反而更慢（4 线程 3.4 ms/条），
+# 因为瓶颈从来不是并行度不足，是过度订阅。
+#
+# 注意 mel **不能挪到 NPU 上算**：torch_npu 2.1 的 stft 支持不稳，
+# 而且官方 extract_speaker_embedding 也是 CPU 算 mel、只有 ECAPA 上设备。
+SPK_MEL_THREADS = int(os.environ.get("SPK_MEL_THREADS", "4"))
+
+
 @torch.inference_mode()
 def extract_spk(enc, audio, sr, device="cpu", dtype=torch.float32):
     """与 modeling 的 extract_speaker_embedding 逐参数一致（:1988-2001）。"""
@@ -76,11 +89,19 @@ def extract_spk(enc, audio, sr, device="cpu", dtype=torch.float32):
         raise ValueError(f"speaker_encoder 只支持 {SPK_SR}Hz，收到 {sr}")
     if isinstance(audio, np.ndarray):
         audio = torch.from_numpy(audio)
-    mels = mel_spectrogram(
-        audio.reshape(1, -1).float(),
-        n_fft=1024, num_mels=128, sampling_rate=SPK_SR,
-        hop_size=256, win_size=1024, fmin=0, fmax=12000,
-    ).transpose(1, 2)
+    # 只在算 mel 期间限制线程数，算完还回去 —— 不影响进程里其它 torch 计算
+    old = torch.get_num_threads()
+    try:
+        if SPK_MEL_THREADS > 0 and old != SPK_MEL_THREADS:
+            torch.set_num_threads(SPK_MEL_THREADS)
+        mels = mel_spectrogram(
+            audio.reshape(1, -1).float(),
+            n_fft=1024, num_mels=128, sampling_rate=SPK_SR,
+            hop_size=256, win_size=1024, fmin=0, fmax=12000,
+        ).transpose(1, 2)
+    finally:
+        if SPK_MEL_THREADS > 0 and old != SPK_MEL_THREADS:
+            torch.set_num_threads(old)
     return enc(mels.to(device=device, dtype=dtype))[0].float().cpu()
 
 

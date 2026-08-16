@@ -95,17 +95,23 @@ def main():
             print(f"续跑：已有 {done} 行，跳过", flush=True)
     # spk 文件必须跟着 jsonl 一起截断到 done 行。少截/多截都会让 codes 与音色
     # 整体错位 —— 训练不报错，只是每条音频配了别人的音色。
-    if args.spk_out and os.path.exists(args.spk_out):
+    # 注意这里**不能**写成 `if os.path.exists(spk_out)`：文件不存在时 cur=0，
+    # 若 jsonl 已有 done 行（上一轮没开 --spk_out 抽的），跳过检查就会从第 done 条
+    # 开始只补 spk 的后半段 —— 产出 jsonl N 行、spk N-done 行，零告警。
+    # 训练侧 open_spk_memmap 会拦下，但那是数小时之后的事了。
+    if args.spk_out:
         from spk_encoder import SPK_ITEMSIZE
 
         want = done * SPK_ITEMSIZE
-        cur = os.path.getsize(args.spk_out)
+        cur = os.path.getsize(args.spk_out) if os.path.exists(args.spk_out) else 0
         if cur < want:
             # truncate 到更大的值会**用 0 补齐**，静默产出一批全零音色向量。
             # 正常流程里 spk 先写、jsonl 后写，spk 只可能多不可能少。
             raise SystemExit(
-                f"{args.spk_out} 只有 {cur / SPK_ITEMSIZE:.1f} 行，少于 jsonl 的 {done} 行。"
-                f"两者已错位，删掉 {args.spk_out} 和 {args.output_jsonl} 重抽。")
+                f"{args.spk_out} 只有 {cur / SPK_ITEMSIZE:.1f} 行，少于 jsonl 的 {done} 行。\n"
+                f"常见原因：上一轮没带 --spk_out 就抽了 codes，这轮才加上 —— "
+                f"spk 只能与 codes 同一遍抽，没法事后补。\n"
+                f"删掉 {args.spk_out}（若有）和 {args.output_jsonl} 重抽。")
         if cur > want:
             with open(args.spk_out, "rb+") as f:
                 f.truncate(want)
@@ -134,8 +140,13 @@ def main():
 
             vecs = []
             for p in audios:
-                wav, _ = librosa.load(p, sr=SPK_SR, mono=True)
-                vecs.append(extract_spk(spk_enc, wav, SPK_SR, device=args.device))
+                # 报错必须带上是哪个 wav：43.5w 条跑到一半崩，没有文件名没法定位，
+                # 而这类失败是确定性的（同一条每次都崩），续跑会卡死在同一批。
+                try:
+                    wav, _ = librosa.load(p, sr=SPK_SR, mono=True)
+                    vecs.append(extract_spk(spk_enc, wav, SPK_SR, device=args.device))
+                except Exception as e:
+                    raise RuntimeError(f"抽 speaker 向量失败: {p} —— {type(e).__name__}: {e}")
             v = torch.stack(vecs).to(torch.float16).numpy()
             if v.shape[1] != 2048:
                 raise RuntimeError(f"speaker 向量维度 {v.shape[1]} != 2048")

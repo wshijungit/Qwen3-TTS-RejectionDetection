@@ -28,8 +28,11 @@
    collate 把 label 摆到因果前一格，模型侧用不 shift 的裸 CE，脚本不动。
    三处成套，改一处就错。
 
-3. **无 speaker_encoder / ref_audio**。VoiceDesign 的 speaker_embed 为 None
-   （modeling:2165-2171），codec 前缀里没有 speaker 槽位，音色完全由 instruct 决定。
+3. **speaker 槽位默认没有，给 --spk-file 才有**。不给时走 VoiceDesign 原本的
+   `speaker_embed is None` 路径（modeling:2213-2215），codec 前缀里没有那一格，
+   音色完全由 instruct 决定；给了则插一格并**整格覆盖**其 embedding
+   （逐格布局见 dataset_voicedesign.py 文件头 §2）。训练图里始终不含
+   speaker_encoder —— 向量在数据准备阶段离线抽好（spk_encoder.py）。
 
 单阶段：不新增 text_head、不训 <think> 生成。instruct 只作输入侧条件，
 输出端仍只有 codec。多阶段（text-head 解耦）留给后续。
@@ -185,9 +188,10 @@ def train():
              "给了就在 codec 前缀里多插一格 speaker，块宽 5→6")
     parser.add_argument(
         "--spk-drop-prob", type=float, default=0.0,
-        help="训练时按此概率把 spk 向量整条置零，等价于「这条没有 speaker」。"
-             "默认 0 —— 此时训完的模型**必须永远给 spk**，不给就是训练中从未出现过的输入。"
-             "想让同一个 ckpt 既能纯 instruct 又能带音色，把它调到 0.1-0.3")
+        help="训练时按此概率把 spk 向量**置零**（注意：不是去掉那一格）。默认 0。"
+             "无论 drop 与否，序列永远是 6 格块 —— 而推理侧不传 speaker 走的是 5 格块，"
+             "两者不是一回事。所以训完做「纯 instruct」推理时仍要带这一格、传全零向量；"
+             "完全不传 spk 永远是失配。调到 0.1-0.3 可让同一个 ckpt 兼顾两种用法")
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum,

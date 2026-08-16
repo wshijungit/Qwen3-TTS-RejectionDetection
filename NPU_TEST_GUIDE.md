@@ -1245,8 +1245,13 @@ python npu_smoke_test.py --model_path <VoiceDesign> \
 
 **`--spk-drop-prob` 默认 0**，即训练时每条都有 spk。这意味着
 **训完的模型必须永远给 spk** —— 不给就是训练中从未出现过的输入，不报错，
-只表现为音色/音质乱。想让同一个 ckpt 既能纯 instruct 又能带音色，调到 0.1-0.3。
-config 里会记 `v2_train_spk` / `v2_train_spk_drop_prob` 供推理侧对齐。
+只表现为音色/音质乱。config 里会记 `v2_train_spk` / `v2_train_spk_drop_prob`
+供推理侧对齐。
+
+⚠️ **drop 置零 ≠ 不传 spk，这两件事不一样**：drop 掉的样本仍是 **6 格块 +
+全零向量**；而推理侧 `speaker=None` 走的是 **5 格块、根本没有这一格**
+（modeling:2213-2215）。所以即使把 drop 调到 0.1-0.3，做「纯 instruct」推理时
+**也要照样带这一格、传全零向量**；完全不传 spk 在任何 drop 取值下都是失配。
 
 ### 17.5 开发机已验的（H200，全部实测）
 
@@ -1278,6 +1283,24 @@ config 里会记 `v2_train_spk` / `v2_train_spk_drop_prob` 供推理侧对齐。
 stft 支持一直不稳。当前实现里 **mel 在 CPU 上算**，只有 ECAPA 前向在设备上
 （与官方 `extract_speaker_embedding` 的做法相同），所以不碰 NPU 的 stft。
 **改这段代码时不要顺手把 mel 挪到设备上。**
+
+### 17.5c 抽 spk 的耗时：注意 `SPK_MEL_THREADS`
+
+mel 在 CPU 上算，而 torch 默认把机器上**所有核**都拿去跑 —— 对一段 1-4 秒音频的
+小 STFT 来说纯粹是线程调度开销。开发机 192 核上实测（48 条 1-4s，含
+librosa.load + mel + ECAPA 前向）：
+
+| | ms/条 | 43.5w 条 |
+|---|---|---|
+| torch 默认线程（192） | 77.6 | **9.4 h** |
+| `SPK_MEL_THREADS=4`（默认值） | **6.1** | **0.74 h** |
+
+**12.7 倍**，而且两者输出**逐位相同**（已验，线程数不影响数值）。
+代码里已默认设为 4 并在算完还原，不影响进程内其它 torch 计算。
+
+昇腾机核数不同，若 `ms/条` 明显高于 6，试 `SPK_MEL_THREADS=1` 或 `2`
+（本机 1 与 4 差别很小；关键是**别用默认的全核**）。
+先抽 200 条看 ms/条 再决定要不要调，别直接上 43.5w。
 
 **没验的**：Base 的 embedding 空间与 VoiceDesign 的 talker 是否真的兼容。
 VoiceDesign 是从 Base 继续训的，可能已经漂了。这一格是靠微调重新学出来的，
