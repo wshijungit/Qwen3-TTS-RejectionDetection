@@ -1164,6 +1164,15 @@ done
 | 2 | **全量 43.5w 条三步**：§11.3 数据准备 → 抽码（带 `SPK_FILE`）→ 训练 | 开跑前先 `ls $S` 确认路径存在（见下） | 第一步报告里 `wav_not_found` ≠ 0 |
 | 3 | 多卡才需要：`check_ddp_sync.py`（§9.3） | 单卡跑全量的话可跳过 | 打 ❌ 就别跑多卡 |
 
+**2026-08-16 NPU 实测回填**：
+- ✅ #0：§17.6 四条已全部回填（sessionid 有、1.7B-Base 已下载、$S 前缀确认）
+- ✅ #1：**带 spk 冒烟 0-8 全过**（`npu_smoke_report_spk.txt` 已随提交）——阶段 4b
+  的 spk 随 jsonl 断点续跑同步对齐（行边界/半行两种截断均验证）、NPU vs CPU
+  抽取余弦 1.0（最大绝对差 4.08e-04）、两次抽取逐位一致；阶段 5 十三项全 PASS
+  （块宽 6、spk 槽位位置、spk_pos、mask、逐位一致、非全零）；阶段 6 含 spk 训练
+  6 步正常（(10, 2048) 向量加载）；阶段 8 时长差 53.3% instruct 生效。
+- 剩 #2（全量三步）与 #3（多卡才需要）。
+
 **开跑前先确认这一条**（开发机无法验证，是本轮唯一的存疑项）：
 
 ```bash
@@ -1324,3 +1333,19 @@ pull 到这版后请把答案直接写在本节下面：
 3. 磁盘：spk 文件 43.5w 条 ≈ 1.78GB，与 §11.3 的 13GB ckpt 账相加即可。
 
 4. （仍未答）§16 那条 `ls` —— `$S` 前缀到底是哪个。
+
+**2026-08-16 NPU 侧回填**：
+
+1. **有 session 标识，无说话人标识**。打标 jsonl 里字段为
+   `sessionid`（形如 `<uuid>__chunkNNN`，跨数据集唯一）+ `interactionid`
+   （session 内轮次序号 1-10）+ `session_turn_count`。无 speaker/spk/role
+   字段（data_report.md 早已确认：三层数据里都没有说话人信息）。
+   后续「同 session 平均」可行：按 `sessionid` 分组即可。
+2. **本机原只有 0.6B-Base，enc_dim=1024，与 VoiceDesign 1.7B 的 2048 不匹配，
+   不可用于抽 spk**（spk_encoder.py 的 SPK_DIM=2048 硬核对）。
+   已下载 **1.7B-Base**：`/home/ma-user/work/dataset/wsj-mimo-data/Qwen3-TTS-12Hz-1.7B-Base`
+   （软链 `/home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base`），
+   speaker_encoder 76 张量、`speaker_encoder_config.enc_dim=2048` ✓。
+4. **`$S` 前缀存在且正确**：
+   `ls /home/ma-user/work/dataset/stc_data/dataset/cabin_duplex_data_artif/yibuapi_outputs/`
+   下三个 jsonl 都在（§11.1/§11.2 实测即用此路径，无歧义）。
