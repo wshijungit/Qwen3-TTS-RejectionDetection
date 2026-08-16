@@ -692,14 +692,39 @@ python prepare_data.py --device npu:0 \
 > 已知：batch encode 不具备 padding 不变性，续跑会改变 batch 分组，个别处在
 > VQ 边界上的帧会翻到邻近码字。对音质无影响，但 codes 不逐位可复现。
 
+#### 第二步之二：抽 speaker 向量（约 8h，见 §16.2）
+
+```bash
+SPK_MEL_THREADS=4 \
+python prepare_data.py --spk-only --device npu:0 \
+  --input_jsonl $W/v2/train_codes.jsonl \
+  --spk_out /home/ma-user/work/dataset/wsj-mimo-data/qwen3_spk_emb/spk.f16 \
+  --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base
+```
+
+**为什么单列一步而不是跟抽码一起**：抽码那条命令不带 `--spk_out`，
+所以跑完只有 codes；spk 用独立模式补抽即可（对齐靠 codes.jsonl 自身行顺序，
+产出与耦合模式逐位相同）。中途崩了重跑同一条命令续跑。
+`--spk_out` 的路径要与启动脚本的 `SPK_FILE` 默认值一致（就是上面这个）。
+
+抽完按 §16.2 末尾的自查脚本核一遍行数/全零/NaN。
+
 #### 第三步：正式训练
 
 ```bash
 cd scripts
+SKIP_PREPARE=1 \
 BATCH_SIZE=8 GRAD_ACCUM=1 EPOCHS=1 \
 DTYPE=fp32 ATTN=sdpa \
 bash run_v2_npu_debug.sh
 ```
+
+**必须带 `SKIP_PREPARE=1`** —— 不带的话脚本会再跑一遍 prepare_data.py，
+而它现在带着 `--spk_out`（`SPK_FILE` 有默认值），面对「codes 已全抽完、
+spk 也已存在」会因行数检查直接退出。codes 和 spk 都齐了，本来也不需要再准备。
+
+脚本默认 `SPK_FILE=/home/ma-user/work/dataset/wsj-mimo-data/qwen3_spk_emb/spk.f16`，
+所以**不用显式传**；想跑不带 speaker 的对照组则显式置空：`SPK_FILE= bash ...`。
 
 启动脚本已透传 `SAVE_EVERY`（默认 **500** 步）与 `LENGTH_BUCKET`（默认 64）。
 19-21 小时的 epoch 中途崩掉，只在 epoch 末落盘等于全丢，所以默认就开着。
@@ -1587,3 +1612,58 @@ pull 到这版后请把答案直接写在本节下面：
    不是算力**（开发机 5.8 ms/条 vs 昇腾 66.3 ms/条，encoder 部分反而是
    开发机 4.6 vs 昇腾 15.3，差距远小于端到端的 11 倍）。要提速往
    「wav 挪本地盘 / 源存 24k」上想，调线程数在那边只有 13% 空间。
+
+## 18. 全量可以开跑了 —— 检查清单（2026-08-16）
+
+所有阻塞项已清。**按 §11.3 的四步顺序照抄即可**，本节只列开跑前要确认的与要盯的。
+
+### 18.1 前置（都已完成，列出来备查）
+
+| 项 | 状态 |
+|---|---|
+| 冒烟 0-8（含 spk）在昇腾全过 | ✅ `npu_smoke_report_spk2.txt` |
+| 256 条真实数据带 spk 验通过 | ✅ 时长差 29.8%（基线 34.6%），spk 没压掉 instruct |
+| `$S` 路径、1.7B-Base、sessionid 字段 | ✅ §17.6 四条全部回填 |
+| `SPK_MEL_THREADS` | ✅ 昇腾最优 4（影响仅 13%，照抄默认即可） |
+| 训练热启路径 | ✅ 权重级热启 + 换 `OUTPUT_DIR`（§11.3 末） |
+
+### 18.2 四步与预计耗时
+
+| 步 | 做什么 | 预计 | 崩了怎么办 |
+|---|---|---|---|
+| 1 | 数据准备（VAD） | 数小时 | `--skip-existing` 续跑 |
+| 2 | 抽 codes | 数小时 | 重跑同一条命令 |
+| 2.5 | 抽 spk（`--spk-only`） | **约 8h** | 重跑同一条命令 |
+| 3 | 训练（`SKIP_PREPARE=1`） | 19-21h | 权重级热启，**换新 `OUTPUT_DIR`** |
+
+**第 3 步必须带 `SKIP_PREPARE=1`**，理由见 §11.3。
+
+### 18.3 三个容易踩的
+
+1. **spk 的 8 小时瓶颈在 I/O 不在算力**（昇腾端到端 66.3 ms/条 vs 开发机
+   5.8 ms/条，而 encoder 部分只有 15.3 vs 4.6）。原因是 SFS 网络盘 + 16k 源
+   要重采样到 24k。**若嫌慢，把 trimmed wav 挪到本地盘再抽**，别去调线程数。
+   也可以与第 1 步的产出并行——spk 只依赖 trimmed wav 和 codes.jsonl 的行序。
+2. **中间产物别放 /tmp**（十二轮的教训：/tmp 被清理导致 trimmed wav 全没、
+   spk 抽取全崩）。wav 和 spk 都放 SFS。
+3. **`spk.f16.meta` 别删** —— 续跑靠它确认没换过输入。训练只传 `spk.f16`。
+
+### 18.4 训练中要盯的（在 §11.3 那张表基础上加一条）
+
+启动日志里必须出现这一行，否则 spk 根本没生效：
+
+```
+speaker 向量 (435000, 2048) ← .../spk.f16（drop_prob=0.0）
+```
+
+行数与 `train_codes.jsonl` 对不上会当场崩（`open_spk_memmap` 硬校验），不会静默。
+
+### 18.5 训完第一件事
+
+`--spk-drop-prob` 是 **0**，所以**推理必须永远传 spk**（哪怕是全零向量）。
+完全不传走的是 5 格块，是训练中从未出现过的输入 —— 不报错，只表现为音色乱。
+详见 §17.4 的 ⚠️。
+
+**唯一仍未验证的**：Base 的 embedding 空间与 VoiceDesign talker 是否真的兼容。
+256 条那轮的两个判据都过了（loss 同量级、时长差仍两位数），但那只说明
+「没有变坏」，音色到底跟不跟得住得训完听。
