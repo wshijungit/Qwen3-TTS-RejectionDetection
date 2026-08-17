@@ -1846,8 +1846,18 @@ codec 前缀格数就对不上（5 格 vs 4 格），不报错但结果不对 �
    设备检查，反证了那边加载的是带 `to()` 覆写的这一份）。
 
    已在 `sft_12hz_voicedesign.py` / `prepare_data.py` / `eval_v2_spk.py` /
-   `npu_smoke_test.py` 四处把**本仓库根顶到 `sys.path[0]`**，无论从哪个目录跑、
-   无论 editable 装到哪，都只会 import 到仓库内的 qwen_tts。四处均已实测。
+   `npu_smoke_test.py` / `check_ddp_sync.py` 五处把**本仓库根顶到 `sys.path[0]`**。
+
+   > **更正（十五轮）**：首次实现时 `sft_12hz_voicedesign.py` 的守卫被放在
+   > `from dataset_voicedesign import ...` **之后**，而后者自己就 import qwen_tts
+   > —— 等 qwen_tts 进了 `sys.modules`，再改 `sys.path` 完全无效，**守卫是死代码**。
+   > 我当时的"验证"只复刻了文件头那几行 `sys.path` 操作，没有复现真实 import 顺序，
+   > 所以看不出来。已把守卫移到全部第三方 import 之前，并改用
+   > `cd <目录> && python -c "import <模块>; print(qwen_tts...__file__)"` 复验五处。
+   >
+   > 另加一道**运行时断言**：加载到的 modeling 若没有 `_compute_token_ce_loss`
+   > 就当场 SystemExit 并说明后果。守卫可能再被 import 顺序绕过，断言不会 ——
+   > 它只看最终加载到的是什么。
 
 5. 【低】`_normalize_spk_embedding` 加 NaN/Inf 检查（原先静默通过，产物是坏音频
    且无从排查）、扁平 `list[float]` 兜住；`--spk-source file:` 的解析改为
@@ -1913,3 +1923,43 @@ NPU 侧不受影响：启动脚本里 `pip install --user -e "$REPO_ROOT"` 装�
 但四个脚本现在都会把仓库根顶到 `sys.path[0]`，无论从哪跑、无论 editable 装到哪，
 都只会 import 仓库内的 qwen_tts。**若这次重跑阶段 0 报 qwen_tts 相关的异常，
 先确认 `python -c "import qwen_tts; print(qwen_tts.__file__)"` 指的是哪。**
+
+### 十五轮（开发机）：守卫是死代码 + 历史训练结论重验（2026-08-17）
+
+1. **【高】上一轮的 `sys.path` 守卫在训练脚本里是死代码**（第九次「声称做了但没做到」）
+
+   守卫被放在 `from dataset_voicedesign import ...` **之后**，而后者自己就
+   `import qwen_tts` —— 等 qwen_tts 进了 `sys.modules`，再改 `sys.path` 完全无效
+   （子模块沿父包 `__path__` 解析）。**于是开发机的训练至今仍在用参考仓库的
+   二次 shift loss**，也就是说上一轮那条修复什么都没修上。
+
+   **我当时的"验证"为什么看不出来**：只 exec 了文件头那几行 `sys.path` 操作，
+   没有复现真实的 import 顺序 —— 验的是守卫本身，不是守卫的效果。
+   改用 `cd <目录> && python -c "import <模块>; print(qwen_tts...__file__)"` 复验，
+   五处（含新加的 `check_ddp_sync.py`）全部正确。
+
+   **另加一道运行时断言**：加载到的 modeling 若没有 `_compute_token_ce_loss`
+   就当场 SystemExit 并说明后果。守卫可能再被 import 顺序绕过，断言不会 ——
+   它只看最终加载到的是什么。已实测：强行让参考仓库先加载时断言正常触发。
+
+2. **历史训练结论重验**（在正确 modeling 上）
+
+   | 结论 | 重验后 |
+   |---|---|
+   | label shift 三处成套 | ✅ 成立。最强证据是方向性对照：预训练权重下「预测下一格」CE 2.04 < 同位 3.80 < 隔两格 4.58，训练目标恰好取最低 |
+   | `_sub_talker_loss` 与主路径同向 | ✅ 成立（正确配对 6.05 < 同位配对 6.55） |
+   | `text_projection` 训推一致 | ✅ 成立（投影非恒等：范数 1.83→5.85，cos≈0） |
+   | `V2TrainStep` 让 autocast 生效 | ✅ 成立（经 wrapper 是 bf16，绕过是 fp32） |
+   | DDP 真同步 | ✅ 2×H200 实测两 rank grad.sum 完全一致 |
+   | spk 整格覆盖 + 训推逐格一致 | ✅ 成立（最大差 3.1e-07，fp32 浮点噪声） |
+   | 正确代码下能收敛 | ✅ 10 条×30 复制、150 步，loss 3.53 → 0.11-0.21 |
+   | **开发机历次冒烟阶段 6 的 loss 曲线 / 吞吐** | ❌ **作废** —— 描述的是双 shift 的错误目标 |
+
+3. 【低】`check_ddp_sync.py` 补守卫（它原先只插 `finetuning/`）；
+   `_normalize_spk_embedding` 兜住 `np.number` 标量（`list(np_vector)` 会漏进
+   逐元素分支后崩在 ndarray 没有 `.to` 上）；`--device` 帮助文案改为
+   「阶段 4/4b/8 都用」。
+
+**教训**：这次和上次是同一个错误的两种形态 —— **验证复刻了代码，而不是复现了场景**。
+`sys.path` 守卫要验的是"真实 import 顺序下加载到谁"，不是"这几行能不能跑"。
+凡是防御性代码，验证必须构造出它本该拦住的那个失败。

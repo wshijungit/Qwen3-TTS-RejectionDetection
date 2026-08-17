@@ -29,7 +29,13 @@ try:
 except Exception:
     pass
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 仓库根 + finetuning 都要，且必须在 import qwen_tts / dataset_voicedesign 之前
+# （理由同 sft_12hz_voicedesign.py 头部）。这里 dirname 要三层才是仓库根。
+_FT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(_FT)
+for _p in (_FT, _REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 def main():

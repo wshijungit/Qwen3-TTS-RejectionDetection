@@ -769,7 +769,9 @@ class Qwen3TTSModel:
         """把 numpy / torch / list 统一成 n 个 [2048] 的 talker dtype 张量。"""
         # 扁平的 Python 数字序列（[0.0]*2048）先兜成 ndarray，否则下面
         # 逐元素 .reshape 会抛 AttributeError: 'float' object has no attribute
-        if isinstance(spk, (list, tuple)) and spk and isinstance(spk[0], (int, float)):
+        # np.float32 之类的标量不是 int/float 的实例，list(np_vector) 这种输入
+        # 会漏进逐元素分支，最后崩在 ndarray 没有 .to 上，故一并兜住
+        if isinstance(spk, (list, tuple)) and spk and isinstance(spk[0], (int, float, np.number)):
             spk = np.asarray(spk, dtype=np.float32)
         if isinstance(spk, np.ndarray):
             spk = torch.from_numpy(spk)

@@ -843,7 +843,8 @@ def main():
                     help="已抽好 audio_codes 的 jsonl，给定则跳过阶段 4。"
                          "音频 tokenizer 在 NPU 上跑不动时，可先在 CPU 上抽好再用这个")
     ap.add_argument("--workdir", default=None)
-    ap.add_argument("--device", default="npu:0", help="阶段 4b 传给 prepare_data.py")
+    ap.add_argument("--device", default="npu:0",
+                    help="阶段 4/4b/8 都用它（4b 传给 prepare_data.py，8 用于搬模型）")
     ap.add_argument("--skip-pipeline", action="store_true",
                     help="跳过阶段 4b（生产数据准备链路）")
     ap.add_argument("--use-pipeline-codes", action="store_true",
