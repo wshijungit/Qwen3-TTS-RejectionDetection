@@ -1377,9 +1377,17 @@ spk 把 instruct 的控制力压掉了 —— 那正是 ref==target 最担心的
 **2026-08-16 NPU 小批量验回填**：带 spk 200 步（同配置，重建的 256 条）——
 loss 前/后 20 步均值 **3.8949 → 3.8979**（与基线尾段 ~4.0 同量级，无干扰迹象；
 但单 epoch 每条只见一次，loss 趋势本就不是有效判据，更硬的验证要固定小样本
-多 epoch）；阶段 8 时长差 **29.8%**（对机 6.80s / 对人 9.68s），仍两位数，
-**spk 没有压掉 instruct 的控制力**。两个判据都过，报告
+多 epoch）；阶段 8 时长差 **29.8%**（对机 6.80s / 对人 9.68s）。报告
 `npu_smoke_report_real256_spk.txt` 随提交。
+
+> ⚠️ **更正（2026-08-17，fable review 查出）**：那句「29.8% 说明 spk 没有压掉
+> instruct 的控制力」**不成立**。当时的阶段 8 从不传 `spk_embedding`——
+> 也就是「ckpt 用 6 格块训、推理按 5 格块跑」的**失配**条件，而这正是本轮推理侧
+> 防呆现在明令禁止的配置。所以那个数既不能证明 spk 无害，也无法复现。
+>
+> 阶段 8 已修（会从 `--spk_file` 取第 0 行传进去），**下次冒烟拿到的才是可比的数**。
+> 「spk 会不会压掉 instruct」这个问题目前**仍未回答**，要靠 §19.2 的
+> `eval_v2_spk.py` 在全量 ckpt 上做带 spk / `zero` 的对照。
 
 **开跑前先确认这一条**（开发机无法验证，是本轮唯一的存疑项）：
 
@@ -1693,3 +1701,265 @@ speaker 向量 (435000, 2048) ← .../spk.f16（drop_prob=0.0）
    `missing_true_label` 438 / `vad_too_short` 96 / `partial_recovery` 38。
    筛选后 reject 占比 28.7→23.1% / 34.9→29.1% / 48.6→45.1%，与 §11.1 预期吻合。
    **训练集构成 = 打标与真值一致 + 去重 + 标签齐全 + VAD 后 ≥0.3s 人声**
+
+> **备注（不影响训练，有空再看）**：上面五类合计 64,069，而
+> 497,780 − 432,711 = 65,069，差 1,000 条 —— 占 0.23%，**不用为此拖延训练**。
+> 大概率只是没列全：`prepare_v2_data.py` 共有 12 个丢弃计数，这里只列了 5 个，
+> 剩下的 `json_parse_fail` / `missing_field` / `empty_text` / `empty_evidence` /
+> `empty_reason` / `worker_crash` 装着那 1,000 条。
+>
+> 哪天顺手跑一下就行：
+> ```bash
+> python -c "import json;d=json.load(open('$E/data/v2/stats.json'));
+> print({k:v for k,v in d.items() if isinstance(v,int) and v})"
+> ```
+> 只有 `worker_crash` 值得留意 —— 它不是「按规则筛掉」，而是处理时崩了
+> **整块跳过**（`prepare_v2_data.py:765`）。是 0 就完全不用管；不是 0 的话，
+> 日志里会有对应的 `⚠ 分块 […] 处理中断`，说明数据准备有不稳定因素，
+> 下次重跑前值得查一下 —— 但对这次的 43 万条训练没有影响。
+
+
+## 19. 训完怎么测 —— 推理侧的 speaker 槽位
+
+### 19.1 为什么必须改推理
+
+训练带了 `--spk-file`，序列里就多一格 speaker。**推理不给这一格 = 训练中从未
+出现过的输入**：不报错，只表现为音色/音质乱。反过来给了没训过的 ckpt 也一样。
+
+原来的 `generate_voice_design(text, instruct, language)` 没有传向量的正式入口
+（只能手工拼 `voice_clone_prompt` 那个 dict），所以**训完没法测**。已加参数：
+
+```python
+wavs, sr = m.generate_voice_design(
+    text="打开空调", instruct="...", language="Chinese",
+    spk_embedding=vec,          # np.float32[2048] / torch tensor / 每条一个的 list
+)
+```
+
+内部会拼成 `voice_clone_prompt={"ref_spk_embedding": [...],
+"x_vector_only_mode": [True], "icl_mode": [False], "ref_code": None}` ——
+`x_vector_only_mode` 必须 True 才会真的填进那一格（modeling:2149-2152），
+`icl_mode` 必须 False 否则会走 ICL 分支去要 ref_code（:2235），而 V2 没有参考音频。
+
+**三道防呆**（都已实测）：
+
+| 情况 | 行为 |
+|---|---|
+| ckpt 有 `v2_train_spk=True` 但不传 | **报错**，并说明「传全零」与「不传」不是一回事 |
+| 传了但 ckpt 没有 `v2_train_spk` | warning |
+| 向量不是 2048 维 | 报错，指出是第几条、多少维 |
+
+### 19.2 `eval_v2_spk.py` —— V2 效果就看这张表
+
+**V2 存在的意义**：真实数据里文本与拒识标签强相关（说"打开空调"基本都是对机的），
+拒识模型容易退化成背文本。V2 要做的是**同一句文本，两种腔调都合成一遍**。
+这个脚本就是验它成没成 —— 同一条 text × 对机/对人两种 instruct，
+**用同一个 spk 向量把音色摁住**，只剩腔调在变。
+
+```bash
+cd finetuning
+python eval_v2_spk.py --ckpt <训练产出的 ckpt> --device npu:0 \
+  --spk-source file:$E/qwen3_spk_emb/spk.f16:0 \
+  --out-dir $E/runs/eval_v2
+```
+
+`--spk-source` 三种：
+
+- `file:<spk.f16>[:行号]` —— 从全量抽好的向量里取一行（默认第 0 行）
+- `wav:<音频>` —— 现抽（要配 `--spk_model_path` 指 1.7B-Base）
+- `zero` —— 全零向量，即「只要 instruct 控制、不指定音色」
+
+产出每句两个 wav + `summary.json`（时长/能量），并打平均时长差。
+
+**怎么判读**：时长差是最容易自动看的代理指标（对机腔通常更短更利落）。
+
+**不要拿 §11.2/§16.1 里 34.6%、29.8% 那两个数当基线**：它们出自冒烟阶段 8，
+instruct 文案与本脚本不同，且 29.8% 那次是在「训练带 spk、推理不带 spk」的
+失配条件下测的（见 §16.1 的更正）。**唯一可比的对照是本脚本自己跑两次**：
+`--spk-source file:...` 与 `--spk-source zero`。
+
+另外每个 (text, instruct) 只采样一次，`temperature 0.9` 下单句时长差噪声很大
+（实测同一 ckpt 各句 11%~85%），**看均值别看单句**，句子少时多跑几遍。
+
+- 平均时长差是两位数 → instruct 通路正常
+- **掉到个位数 → 换 `--spk-source zero` 再跑一次**。若差异明显变大，
+  说明是 spk 那一格把 instruct 压过去了 —— 即 ref==target 的 shortcut
+  （模型从音色向量里读出了「这句原本怎么说的」，instruct 退化成摆设）。
+  真出现了，下一版把 spk 换成**同 session 平均向量**（sessionid 字段已确认存在，
+  §17.6 问题 1），平掉逐句韵律只留音色。
+
+**最终还是要听。** 时长差只是代理指标，不是结论。
+
+### 19.3 语言必须与训练一致
+
+脚本默认读 ckpt 里的 `v2_train_language`。训练 Chinese、推理 Auto 的话
+codec 前缀格数就对不上（5 格 vs 4 格），不报错但结果不对 —— 别手工传 `--language`
+除非你知道自己在干什么。
+
+### 十四轮（开发机）：fable review 六条 + 一个环境陷阱（2026-08-17）
+
+`a0a5224..` 本轮。前三条是 fable 查出的，第四条是查它们时顺带发现的。
+
+1. **【高】冒烟阶段 8 没跟上推理侧新防呆** —— 阶段 6 带 `--spk-file` 训出的 ckpt
+   写了 `v2_train_spk=True`，阶段 8 却不传 `spk_embedding`，被新加的防呆
+   `ValueError` 拦下 → **带 spk 的冒烟必挂在阶段 8**。这正是本项目反复出现的
+   "新增功能后旧调用点没跟着改"（第八次）。已让阶段 8 从 `--spk_file` 取第 0 行传入；
+   没有 spk 文件时退回全零并明确 warn。顺带让阶段 8 跟 `--device` 走
+   （原来写死 `npu:0`，开发机上根本没法验）。
+
+2. **【中高】`eval_v2_spk.py` 的默认 instruct 以「应当拒识 / 不应拒识」收尾** ——
+   而 `prepare_v2_data.py` 的 `strip_verdict` **专门把这两个词从训练 instruct 里剥掉**
+   （实测 "…下达指令。应当拒识" → "…下达指令。"）。等于两条 instruct 之间
+   **区分度最强的词恰好是模型从没见过的**，这张评测表会失真。已改写成
+   gemini evidence+reason 的真实风格，并加断言：两条 instruct 过 `strip_verdict` 后不变。
+
+3. **【中】§16.1 里「29.8% 说明 spk 没压掉 instruct」这个结论不成立** ——
+   那次阶段 8 从不传 spk，即「6 格块训、5 格块推」的**失配**条件，
+   而这正是现在防呆明令禁止的配置。该数无法复现，已在 §16.1 就地更正，
+   §19.2 也删掉了拿它当基线的说法（唯一可比的对照是 `eval_v2_spk.py`
+   自己跑 `file:` 与 `zero` 两次）。**「spk 会不会压掉 instruct」目前仍未回答。**
+
+4. **【高·环境】开发机的 `pip -e` 指向的是参考仓库，不是本仓库**
+
+   ```
+   __editable___qwen_tts_0_1_1_finder.py → 'qwen_tts': '/home/swx/workspace/Qwen3-TTS/qwen_tts'
+   ```
+
+   于是**从 `finetuning/` 或 `finetuning/scripts/` 跑任何脚本，import 到的都是
+   参考仓库那一份**（从仓库根跑才是对的，因为 CWD 会遮蔽）。而参考仓库里
+   本仓库对 modeling 的三处改动一个都没有：
+
+   | 改动 | 参考仓库 | 本仓库 |
+   |---|---|---|
+   | `from __future__ import annotations`（py3.9 必需） | ✗ | ✓ |
+   | `_compute_token_ce_loss`（不二次 shift） | ✗ | ✓ |
+   | `to()` 搬 speech_tokenizer | ✗ | ✓ |
+
+   **后果**：冒烟阶段 6 是 `cd finetuning && python sft_...` 跑的，所以
+   **开发机上的训练一直在用 `self.loss_function`，即二次 shift 的目标**。
+   loss 照降（模型去学了个错位一格的任务），完全不报错。
+   开发机上历次"loss 前 N 步 → 后 N 步下降"的结论**只能证明训练跑得通，
+   不能证明目标正确**。
+
+   **NPU 侧不受影响**：启动脚本里 `pip install --user -e "$REPO_ROOT"`
+   装的就是本仓库（`npu_smoke_report_spk2.txt` 阶段 8 能通过 speech_tokenizer
+   设备检查，反证了那边加载的是带 `to()` 覆写的这一份）。
+
+   已在 `sft_12hz_voicedesign.py` / `prepare_data.py` / `eval_v2_spk.py` /
+   `npu_smoke_test.py` / `check_ddp_sync.py` 五处把**本仓库根顶到 `sys.path[0]`**。
+
+   > **更正（十五轮）**：首次实现时 `sft_12hz_voicedesign.py` 的守卫被放在
+   > `from dataset_voicedesign import ...` **之后**，而后者自己就 import qwen_tts
+   > —— 等 qwen_tts 进了 `sys.modules`，再改 `sys.path` 完全无效，**守卫是死代码**。
+   > 我当时的"验证"只复刻了文件头那几行 `sys.path` 操作，没有复现真实 import 顺序，
+   > 所以看不出来。已把守卫移到全部第三方 import 之前，并改用
+   > `cd <目录> && python -c "import <模块>; print(qwen_tts...__file__)"` 复验五处。
+   >
+   > 另加一道**运行时断言**：加载到的 modeling 若没有 `_compute_token_ce_loss`
+   > 就当场 SystemExit 并说明后果。守卫可能再被 import 顺序绕过，断言不会 ——
+   > 它只看最终加载到的是什么。
+
+5. 【低】`_normalize_spk_embedding` 加 NaN/Inf 检查（原先静默通过，产物是坏音频
+   且无从排查）、扁平 `list[float]` 兜住；`--spk-source file:` 的解析改为
+   只有尾段全数字才当行号（路径含冒号不再崩）；`--texts` 空文件不再 ZeroDivisionError；
+   防呆提示补一句"drop_prob=0 时全零向量本身也没被训过"。
+
+**教训**：第 4 条这类"import 到了另一份代码"的问题，靠读代码永远发现不了 ——
+是顺着"同样的 `to()` 覆写在 A ckpt 生效、B ckpt 不生效"这个矛盾查出来的。
+**遇到"同样的代码不同结果"，先确认加载的是不是同一份代码。**
+
+## 20. ⚠️ NPU 侧要重跑一次冒烟（2026-08-17）
+
+**结论先行**：已有的三份带 spk 冒烟报告，**阶段 8 的时长差全部作废**。
+重跑一次即可，约十几分钟，**不影响正在进行的训练**。
+
+### 20.1 为什么作废
+
+三份报告的阶段 6 都带了 `--spk-file`（产出 ckpt 写入 `v2_train_spk=True`，
+序列是 6 格块），而当时的阶段 8 **从不传 `spk_embedding`**（按 5 格块推理）：
+
+| 报告 | 阶段 8 时长差 | 状态 |
+|---|---|---|
+| `npu_smoke_report_spk.txt` | 53.3% | ❌ 失配条件下测的 |
+| `npu_smoke_report_spk2.txt` | 16.7% | ❌ 同上 |
+| `npu_smoke_report_real256_spk.txt` | 29.8% | ❌ 同上 |
+
+这正是现在推理侧防呆**明令禁止**的配置（§19.1）。所以：
+
+- 那三个数**既不能证明 spk 无害，也不能证明 instruct 通路正常**，且无法复现
+- 尤其 §16.1 里「29.8% 说明 spk 没有压掉 instruct 的控制力」这句结论**不成立**，
+  已就地更正
+- 16.7% 与 53.3% 差三倍多，本身也说明这个指标在 6 步 ckpt 上噪声极大
+
+阶段 8 已修：会从 `--spk_file` 取第 0 行传进去（没有 spk 文件则用全零并 warn），
+并跟 `--device` 走。**修之前带 spk 的冒烟会直接挂在阶段 8**（被防呆 ValueError 拦下）。
+
+### 20.2 重跑什么
+
+```bash
+cd finetuning/scripts && . ./npu_env.sh
+python npu_smoke_test.py \
+  --model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base \
+  --use-pipeline-codes --report npu_smoke_report_spk3.txt
+```
+
+**要看的两行**（其余照旧）：
+
+1. 阶段 8 应出现 `✅ ckpt 是带 speaker 训的，用 spk.f16 第 0 行推理` ——
+   没这行说明 spk 没接上
+2. 阶段 4b 的 `SPK_MEL_THREADS` 与**端到端 ms/条**（上一版基准只量了 encoder
+   前向，把读盘和重采样漏了，报的 0.5h 与真实的 8h 差了 16 倍，已修）
+
+开发机上修后实测：阶段 5-8 全过，时长差 34.9%。
+
+### 20.3 顺带说明一个开发机独有的坑（NPU 不受影响，但值得知道）
+
+开发机的 `pip -e` 装到了**参考仓库** `/home/swx/workspace/Qwen3-TTS`，
+于是从 `finetuning/` 跑脚本时 import 的是那一份 —— 它没有本仓库对 modeling
+的三处改动，**开发机上的训练一直在用二次 shift 的 loss**（详见复核清单十四轮）。
+
+NPU 侧不受影响：启动脚本里 `pip install --user -e "$REPO_ROOT"` 装的就是本仓库。
+但四个脚本现在都会把仓库根顶到 `sys.path[0]`，无论从哪跑、无论 editable 装到哪，
+都只会 import 仓库内的 qwen_tts。**若这次重跑阶段 0 报 qwen_tts 相关的异常，
+先确认 `python -c "import qwen_tts; print(qwen_tts.__file__)"` 指的是哪。**
+
+### 十五轮（开发机）：守卫是死代码 + 历史训练结论重验（2026-08-17）
+
+1. **【高】上一轮的 `sys.path` 守卫在训练脚本里是死代码**（第九次「声称做了但没做到」）
+
+   守卫被放在 `from dataset_voicedesign import ...` **之后**，而后者自己就
+   `import qwen_tts` —— 等 qwen_tts 进了 `sys.modules`，再改 `sys.path` 完全无效
+   （子模块沿父包 `__path__` 解析）。**于是开发机的训练至今仍在用参考仓库的
+   二次 shift loss**，也就是说上一轮那条修复什么都没修上。
+
+   **我当时的"验证"为什么看不出来**：只 exec 了文件头那几行 `sys.path` 操作，
+   没有复现真实的 import 顺序 —— 验的是守卫本身，不是守卫的效果。
+   改用 `cd <目录> && python -c "import <模块>; print(qwen_tts...__file__)"` 复验，
+   五处（含新加的 `check_ddp_sync.py`）全部正确。
+
+   **另加一道运行时断言**：加载到的 modeling 若没有 `_compute_token_ce_loss`
+   就当场 SystemExit 并说明后果。守卫可能再被 import 顺序绕过，断言不会 ——
+   它只看最终加载到的是什么。已实测：强行让参考仓库先加载时断言正常触发。
+
+2. **历史训练结论重验**（在正确 modeling 上）
+
+   | 结论 | 重验后 |
+   |---|---|
+   | label shift 三处成套 | ✅ 成立。最强证据是方向性对照：预训练权重下「预测下一格」CE 2.04 < 同位 3.80 < 隔两格 4.58，训练目标恰好取最低 |
+   | `_sub_talker_loss` 与主路径同向 | ✅ 成立（正确配对 6.05 < 同位配对 6.55） |
+   | `text_projection` 训推一致 | ✅ 成立（投影非恒等：范数 1.83→5.85，cos≈0） |
+   | `V2TrainStep` 让 autocast 生效 | ✅ 成立（经 wrapper 是 bf16，绕过是 fp32） |
+   | DDP 真同步 | ✅ 2×H200 实测两 rank grad.sum 完全一致 |
+   | spk 整格覆盖 + 训推逐格一致 | ✅ 成立（最大差 3.1e-07，fp32 浮点噪声） |
+   | 正确代码下能收敛 | ✅ 10 条×30 复制、150 步，loss 3.53 → 0.11-0.21 |
+   | **开发机历次冒烟阶段 6 的 loss 曲线 / 吞吐** | ❌ **作废** —— 描述的是双 shift 的错误目标 |
+
+3. 【低】`check_ddp_sync.py` 补守卫（它原先只插 `finetuning/`）；
+   `_normalize_spk_embedding` 兜住 `np.number` 标量（`list(np_vector)` 会漏进
+   逐元素分支后崩在 ndarray 没有 `.to` 上）；`--device` 帮助文案改为
+   「阶段 4/4b/8 都用」。
+
+**教训**：这次和上次是同一个错误的两种形态 —— **验证复刻了代码，而不是复现了场景**。
+`sys.path` 守卫要验的是"真实 import 顺序下加载到谁"，不是"这几行能不能跑"。
+凡是防御性代码，验证必须构造出它本该拦住的那个失败。

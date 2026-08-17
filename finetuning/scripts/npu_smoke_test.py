@@ -42,6 +42,15 @@ try:
 except Exception as _e:  # noqa: BLE001
     _NPU_IMPORT_ERR = _e
 
+# 仓库根必须顶到最前：qwen_tts 若 editable 安装指向了别的副本（开发机实测
+# pip -e 指到了参考仓库 /home/swx/workspace/Qwen3-TTS），从 scripts/ 跑就会
+# import 到那一份 —— 它没有本仓库对 modeling 的三处改动（py3.9 注解、
+# _compute_token_ce_loss 不二次 shift、to() 搬 speech_tokenizer）。
+# 后果不是报错，是冒烟悄悄在测**另一份代码**。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 REPORT = []
 
 
@@ -729,7 +738,7 @@ def s7_ckpt(ckpt_root):
 # ---------------------------------------------------------------- 8 推理
 
 
-def s8_infer(ckpt_dir, attn, workdir, language):
+def s8_infer(ckpt_dir, attn, workdir, language, spk_file=None, device="npu:0"):
     stage(8, "推理（验证 instruct 通路仍生效）")
     log(f"  language={language}（必须与训练一致，否则 codec 前缀块宽不同 = 静默失配）")
     import soundfile as sf
@@ -742,19 +751,44 @@ def s8_infer(ckpt_dir, attn, workdir, language):
         # （它是普通属性不是 nn.Module，nn.Module.to() 递归不到它），故这里不用再单独处理
         m = Qwen3TTSModel.from_pretrained(ckpt_dir, torch_dtype=torch.bfloat16,
                                           attn_implementation=attn)
-        m.model.to("npu:0")
-        m.device = torch.device("npu:0")
+        m.model.to(device)
+        m.device = torch.device(device)
     except Exception as e:
         return fail(f"微调后的 ckpt 加载失败: {type(e).__name__}: {e}")
     st = getattr(m.model, "speech_tokenizer", None)
     if st is not None and getattr(st, "model", None) is not None:
         d = next(st.model.parameters()).device
-        if d.type != "npu":
+        if d.type != torch.device(device).type:
             return fail(f"speech_tokenizer 仍在 {d}",
                         "decode 会在 CPU 上跑 170M 模型逐帧前向，每条约 20 分钟。\n"
                         "检查 modeling_qwen3_tts.py 里 to() 的覆写是否还在")
         ok(f"speech_tokenizer 已在 {d}（decode 不会退回 CPU）")
     ok("微调后的 ckpt 可加载")
+
+    # 阶段 6 若带了 --spk-file，产出的 ckpt 是 6 格块（config.v2_train_spk=True），
+    # 推理不传向量就是训练中从未出现过的输入 —— 推理侧的防呆会直接 ValueError，
+    # 阶段 8 必挂。所以这里必须跟着传。
+    import json as _json
+
+    # 用 ckpt_dir 不用 d —— 上面 `d = next(...).device` 已经把 d 占成设备了
+    with open(os.path.join(ckpt_dir, "config.json"), encoding="utf-8") as f:
+        _cfg = _json.load(f)
+    spk_vec = None
+    if _cfg.get("v2_train_spk"):
+        if spk_file and os.path.exists(spk_file):
+            import numpy as _np
+
+            n = os.path.getsize(spk_file) // 4096
+            spk_vec = _np.asarray(
+                _np.memmap(spk_file, dtype=_np.float16, mode="r", shape=(n, 2048))[0],
+                dtype=_np.float32)
+            ok(f"ckpt 是带 speaker 训的，用 {os.path.basename(spk_file)} 第 0 行推理")
+        else:
+            import numpy as _np
+
+            spk_vec = _np.zeros(2048, dtype=_np.float32)
+            warn("ckpt 是带 speaker 训的但没有 spk 文件，用全零向量推理 —— "
+                 "结构上不失配，但 drop_prob=0 时全零也是没训过的输入，音色仅供参考")
 
     text = "帮我把空调温度调低两度"
     ins = {"对机": "坐在车里对车载语音助手下指令，吐字清晰干脆，音调平稳，句尾利落收住",
@@ -762,7 +796,8 @@ def s8_infer(ckpt_dir, attn, workdir, language):
     durs = {}
     for tag, s in ins.items():
         try:
-            wavs, sr = m.generate_voice_design(text=text, instruct=s, language=language)
+            wavs, sr = m.generate_voice_design(text=text, instruct=s, language=language,
+                                               spk_embedding=spk_vec)
         except Exception as e:
             return fail(f"生成失败: {type(e).__name__}: {e}")
         p = os.path.join(workdir, f"infer_{tag}.wav")
@@ -808,7 +843,8 @@ def main():
                     help="已抽好 audio_codes 的 jsonl，给定则跳过阶段 4。"
                          "音频 tokenizer 在 NPU 上跑不动时，可先在 CPU 上抽好再用这个")
     ap.add_argument("--workdir", default=None)
-    ap.add_argument("--device", default="npu:0", help="阶段 4b 传给 prepare_data.py")
+    ap.add_argument("--device", default="npu:0",
+                    help="阶段 4/4b/8 都用它（4b 传给 prepare_data.py，8 用于搬模型）")
     ap.add_argument("--skip-pipeline", action="store_true",
                     help="跳过阶段 4b（生产数据准备链路）")
     ap.add_argument("--use-pipeline-codes", action="store_true",
@@ -920,7 +956,8 @@ def main():
                 failed.append(7)
         if 8 in want and state["ckpt"]:
             ran.add(8)
-            if not s8_infer(state["ckpt"], args.attn, wd, args.language):
+            if not s8_infer(state["ckpt"], args.attn, wd, args.language,
+                            spk_file=state["spk"], device=args.device):
                 failed.append(8)
     except _Abort:
         pass

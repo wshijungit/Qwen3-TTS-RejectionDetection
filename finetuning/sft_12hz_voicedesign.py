@@ -40,14 +40,46 @@
 import argparse
 import json
 import os
+import sys
 import re
 import shutil
+
+# 仓库根必须顶到 sys.path 最前，**且必须在任何 qwen_tts 相关 import 之前**：
+# qwen_tts 若是 editable 安装且指向别的副本（开发机实测 pip -e 指到了参考仓库
+# /home/swx/workspace/Qwen3-TTS），就会 import 到那一份 —— 它没有本仓库对
+# modeling 的三处改动（py3.9 注解、_compute_token_ce_loss 不二次 shift、
+# to() 搬 speech_tokenizer），不报错，只是训练目标悄悄变成错位一格的任务。
+#
+# **顺序是关键**：dataset_voicedesign 自己就会 import qwen_tts，一旦它先执行，
+# qwen_tts 已进 sys.modules，之后再改 sys.path 完全无效（子模块沿父包
+# __path__ 解析）。守卫放在它下面 = 死代码 —— 本项目已经这样错过一次。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import torch
 from accelerate import Accelerator
 from dataset_voicedesign import VoiceDesignTTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+# 守卫可能因为 import 顺序被绕过（本项目已经踩过一次：守卫写在 dataset_voicedesign
+# 之后 = 死代码）。所以再加一道**运行时断言** —— 不管是什么原因加载错了副本，
+# 这里当场崩，而不是让训练用二次 shift 的 loss 跑完 19-21 小时。
+def _assert_repo_modeling():
+    import qwen_tts.core.models.modeling_qwen3_tts as _m
+
+    if not hasattr(_m, "_compute_token_ce_loss"):
+        raise SystemExit(
+            f"加载到的 qwen_tts 不是本仓库那份：\n  {_m.__file__}\n"
+            f"  期望在 {_REPO_ROOT} 之下。\n"
+            "它缺少 _compute_token_ce_loss —— 会退回 HF 的 loss_function，"
+            "而 collate 已把 label 左移一格，二者叠加就是**二次 shift**："
+            "不报错、loss 照降，但训出来的东西是错的。\n"
+            "多半是 pip -e 装到了别的副本。设 PYTHONPATH 指向本仓库根即可。")
+
+
+_assert_repo_modeling()
 from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
