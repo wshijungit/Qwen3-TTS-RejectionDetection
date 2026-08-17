@@ -1857,3 +1857,59 @@ codec 前缀格数就对不上（5 格 vs 4 格），不报错但结果不对 �
 **教训**：第 4 条这类"import 到了另一份代码"的问题，靠读代码永远发现不了 ——
 是顺着"同样的 `to()` 覆写在 A ckpt 生效、B ckpt 不生效"这个矛盾查出来的。
 **遇到"同样的代码不同结果"，先确认加载的是不是同一份代码。**
+
+## 20. ⚠️ NPU 侧要重跑一次冒烟（2026-08-17）
+
+**结论先行**：已有的三份带 spk 冒烟报告，**阶段 8 的时长差全部作废**。
+重跑一次即可，约十几分钟，**不影响正在进行的训练**。
+
+### 20.1 为什么作废
+
+三份报告的阶段 6 都带了 `--spk-file`（产出 ckpt 写入 `v2_train_spk=True`，
+序列是 6 格块），而当时的阶段 8 **从不传 `spk_embedding`**（按 5 格块推理）：
+
+| 报告 | 阶段 8 时长差 | 状态 |
+|---|---|---|
+| `npu_smoke_report_spk.txt` | 53.3% | ❌ 失配条件下测的 |
+| `npu_smoke_report_spk2.txt` | 16.7% | ❌ 同上 |
+| `npu_smoke_report_real256_spk.txt` | 29.8% | ❌ 同上 |
+
+这正是现在推理侧防呆**明令禁止**的配置（§19.1）。所以：
+
+- 那三个数**既不能证明 spk 无害，也不能证明 instruct 通路正常**，且无法复现
+- 尤其 §16.1 里「29.8% 说明 spk 没有压掉 instruct 的控制力」这句结论**不成立**，
+  已就地更正
+- 16.7% 与 53.3% 差三倍多，本身也说明这个指标在 6 步 ckpt 上噪声极大
+
+阶段 8 已修：会从 `--spk_file` 取第 0 行传进去（没有 spk 文件则用全零并 warn），
+并跟 `--device` 走。**修之前带 spk 的冒烟会直接挂在阶段 8**（被防呆 ValueError 拦下）。
+
+### 20.2 重跑什么
+
+```bash
+cd finetuning/scripts && . ./npu_env.sh
+python npu_smoke_test.py \
+  --model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --spk_model_path /home/ma-user/work/model/Qwen3-TTS-12Hz-1.7B-Base \
+  --use-pipeline-codes --report npu_smoke_report_spk3.txt
+```
+
+**要看的两行**（其余照旧）：
+
+1. 阶段 8 应出现 `✅ ckpt 是带 speaker 训的，用 spk.f16 第 0 行推理` ——
+   没这行说明 spk 没接上
+2. 阶段 4b 的 `SPK_MEL_THREADS` 与**端到端 ms/条**（上一版基准只量了 encoder
+   前向，把读盘和重采样漏了，报的 0.5h 与真实的 8h 差了 16 倍，已修）
+
+开发机上修后实测：阶段 5-8 全过，时长差 34.9%。
+
+### 20.3 顺带说明一个开发机独有的坑（NPU 不受影响，但值得知道）
+
+开发机的 `pip -e` 装到了**参考仓库** `/home/swx/workspace/Qwen3-TTS`，
+于是从 `finetuning/` 跑脚本时 import 的是那一份 —— 它没有本仓库对 modeling
+的三处改动，**开发机上的训练一直在用二次 shift 的 loss**（详见复核清单十四轮）。
+
+NPU 侧不受影响：启动脚本里 `pip install --user -e "$REPO_ROOT"` 装的就是本仓库。
+但四个脚本现在都会把仓库根顶到 `sys.path[0]`，无论从哪跑、无论 editable 装到哪，
+都只会 import 仓库内的 qwen_tts。**若这次重跑阶段 0 报 qwen_tts 相关的异常，
+先确认 `python -c "import qwen_tts; print(qwen_tts.__file__)"` 指的是哪。**
