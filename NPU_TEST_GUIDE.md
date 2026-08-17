@@ -1913,6 +1913,17 @@ python npu_smoke_test.py \
 
 开发机上修后实测：阶段 5-8 全过，时长差 34.9%。
 
+**2026-08-17 NPU 实测回填（`npu_smoke_report_spk3.txt`，已随提交）**：
+
+- 阶段 0-8 全过 ✅，阶段 8 出现 `✅ ckpt 是带 speaker 训的，用 spk.f16 第 0 行推理` ——
+  **推理 spk 通路在昇腾上生效**（§20.2 第 1 条要看的那行有了）
+- 阶段 4b 端到端 **20.4 ms/条 → 43.5w 条约 2.5h**（含 librosa.load + 重采样；
+  encoder 前向 13.8 ms/条，SPK_MEL_THREADS 最优仍为 4）
+- **修后阶段 8 时长差 = 42.9%**（对机 1.68s / 对人 0.96s）——spk 匹配条件下
+  第一个有效数字，取代已作废的 53.3%/16.7%/29.8%
+- 环境坑：/tmp（overlay 50G）再次被冒烟 ckpt 塞满（Disk quota exceeded），
+  冒烟统一 `TMPDIR=<SFS>` 后恢复——中间产物放 SFS 的教训第二次生效
+
 ### 20.3 顺带说明一个开发机独有的坑（NPU 不受影响，但值得知道）
 
 开发机的 `pip -e` 装到了**参考仓库** `/home/swx/workspace/Qwen3-TTS`，
