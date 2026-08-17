@@ -23,6 +23,15 @@ import time
 import numpy as np
 import torch
 
+# 必须把**本仓库根**顶到 sys.path 最前：qwen_tts 若是 editable 安装且指向了别的
+# 副本（开发机上实测 pip -e 指到了参考仓库 /home/swx/workspace/Qwen3-TTS），
+# 从 finetuning/ 目录跑就会 import 到那一份 —— 而它没有本仓库对 modeling 的三处
+# 改动（py3.9 注解、_compute_token_ce_loss 不二次 shift、to() 搬 speech_tokenizer）。
+# 不报错，只是训练目标偷偷变成了错位一格的任务。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # 同目录的 spk_encoder
 
 from qwen_tts import Qwen3TTSTokenizer

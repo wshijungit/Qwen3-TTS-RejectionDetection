@@ -30,8 +30,16 @@ import sys
 import numpy as np
 import soundfile as sf
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 必须把**本仓库根**顶到 sys.path 最前：qwen_tts 若是 editable 安装且指向了别的
+# 副本（开发机上实测 pip -e 指到了参考仓库 /home/swx/workspace/Qwen3-TTS），
+# 从 finetuning/ 目录跑就会 import 到那一份 —— 而它没有本仓库对 modeling 的三处
+# 改动（py3.9 注解、_compute_token_ce_loss 不二次 shift、to() 搬 speech_tokenizer）。
+# 不报错，只是训练目标偷偷变成了错位一格的任务。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # 同目录的 spk_encoder
 
 # 默认评测句：都是「文本本身看不出对谁说」的，这类最能体现 instruct 的作用。
 # 若文本本身就强烈指向某一方（"小P小P打开空调"），两种腔调的差异会被文本盖住。
@@ -44,14 +52,20 @@ DEFAULT_TEXTS = [
     "帮我看看还有多远",
 ]
 
-# instruct 的写法要与训练时一致 —— 训练用的是 gemini 的 evidence + reason
-# 拼成的自然语言（见 prepare_v2_data.py 的 build_instruct），不是标签词。
-# 这里模仿那个风格，而不是写"对机腔"三个字。
+# instruct 必须与训练分布对齐 —— 训练用的是 gemini 的 evidence + reason 拼成的
+# 自然语言（prepare_v2_data.py 的 build_instruct：evidence 用「；」连接，
+# 末尾接 reason），形如：
+#   "用户指令包含明确的车控意图；音频中用户发音清晰且为近场发令。用户明确发出车窗控制指令。"
+#
+# **句尾绝不能写「应当拒识 / 不应拒识」**：prepare_v2_data 的 strip_verdict
+# 专门把这类结论词从 reason 里剥掉（实测 "…下达指令。应当拒识" → "…下达指令。"），
+# 理由是那是打标结论、不是说话方式。若在这里写上，两条 instruct 之间
+# **区分度最强的词恰好是模型从没见过的**，这张评测表就没有参考价值了。
 INSTRUCT = {
-    "机器": "说话人正在与车机语音助手交互；语气明确、音量偏大、吐字清晰，"
-            "像是在下达指令。应当拒识",
-    "人":   "说话人正在与车内其他乘客闲聊；语气随意、音量偏低、语速自然，"
-            "带有对话中的迟疑。不应拒识",
+    "机器": "用户指令包含明确的车控意图；音频中用户发音清晰且为近场发令，"
+            "语速平稳、句尾利落收住。用户在向车机下达控制指令。",
+    "人":   "音频中用户为远场随意说话，语气松弛、存在拖音与迟疑；"
+            "内容不含车控意图。用户在与车内其他乘客交谈。",
 }
 
 
@@ -61,10 +75,15 @@ def load_spk(source, spk_model_path, device):
         return np.zeros(2048, dtype=np.float32), "全零向量"
     kind, _, rest = source.partition(":")
     if kind == "file":
-        path, _, idx = rest.rpartition(":")
-        if not path:                       # 没写行号
-            path, idx = rest, "0"
-        idx = int(idx)
+        # 只有尾段**全是数字**才当行号，否则整串当路径 ——
+        # 路径本身带冒号（或写成 file:/p/spk.f16: ）时不该崩在 int() 上
+        head, sep, tail = rest.rpartition(":")
+        if sep and head and tail.isdigit():
+            path, idx = head, int(tail)
+        elif sep and head and not tail:      # 写成 file:/p/spk.f16: —— 尾随冒号
+            path, idx = head, 0
+        else:
+            path, idx = rest, 0
         from spk_encoder import SPK_DIM, SPK_ITEMSIZE
 
         n = os.path.getsize(path) // SPK_ITEMSIZE
@@ -130,6 +149,8 @@ def main():
     if args.texts:
         with open(args.texts, encoding="utf-8") as f:
             texts = [l.strip() for l in f if l.strip()]
+        if not texts:
+            raise SystemExit(f"{args.texts} 里一句都没有")
 
     m = Qwen3TTSModel.from_pretrained(args.ckpt, torch_dtype=torch.bfloat16,
                                       attn_implementation=args.attn)

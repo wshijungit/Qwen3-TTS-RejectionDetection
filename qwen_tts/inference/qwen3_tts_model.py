@@ -732,7 +732,8 @@ class Qwen3TTSModel:
                 "np.zeros(2048, dtype=np.float32)\n"
                 "  （注意「传全零」和「不传」不是一回事：不传是 5 格块，"
                 f"训练时是 6 格块。drop_prob="
-                f"{getattr(self.model.config, 'v2_train_spk_drop_prob', 0)}）")
+                f"{getattr(self.model.config, 'v2_train_spk_drop_prob', 0)}；"
+                "drop_prob=0 时全零向量本身也没被训过，只是结构上不失配）")
         if spk_embedding is not None and not trained_with_spk:
             warnings.warn(
                 "传了 spk_embedding，但 config 里没有 v2_train_spk=True —— "
@@ -766,6 +767,10 @@ class Qwen3TTSModel:
 
     def _normalize_spk_embedding(self, spk, n):
         """把 numpy / torch / list 统一成 n 个 [2048] 的 talker dtype 张量。"""
+        # 扁平的 Python 数字序列（[0.0]*2048）先兜成 ndarray，否则下面
+        # 逐元素 .reshape 会抛 AttributeError: 'float' object has no attribute
+        if isinstance(spk, (list, tuple)) and spk and isinstance(spk[0], (int, float)):
+            spk = np.asarray(spk, dtype=np.float32)
         if isinstance(spk, np.ndarray):
             spk = torch.from_numpy(spk)
         if torch.is_tensor(spk):
@@ -790,6 +795,10 @@ class Qwen3TTSModel:
         if bad:
             raise ValueError(f"spk_embedding 第 {bad[:3]} 条不是 2048 维："
                              f"{[out[i].numel() for i in bad[:3]]}")
+        # NaN/Inf 会一路传进 talker，产物是坏音频且完全无从排查
+        nan = [i for i, v in enumerate(out) if not torch.isfinite(v).all()]
+        if nan:
+            raise ValueError(f"spk_embedding 第 {nan[:3]} 条含 NaN/Inf")
         return out
 
     # custom voice model
