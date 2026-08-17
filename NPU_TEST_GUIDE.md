@@ -1693,3 +1693,23 @@ speaker 向量 (435000, 2048) ← .../spk.f16（drop_prob=0.0）
    `missing_true_label` 438 / `vad_too_short` 96 / `partial_recovery` 38。
    筛选后 reject 占比 28.7→23.1% / 34.9→29.1% / 48.6→45.1%，与 §11.1 预期吻合。
    **训练集构成 = 打标与真值一致 + 去重 + 标签齐全 + VAD 后 ≥0.3s 人声**
+
+### ⚠️ 待 NPU 侧确认：筛选账目差 1,000 条
+
+上面列的五类合计 **64,069**，但 497,780 − 432,711 = **65,069** —— 差正好 1,000。
+
+不一定是 bug：`prepare_v2_data.py` 一共有 12 个丢弃计数，上面只列了 5 个。
+剩下的 `json_parse_fail` / `missing_field`（3 处）/ `empty_text` /
+`empty_evidence` / `empty_reason` / `wav_not_found` / `worker_crash`
+应该就装着那 1,000 条。**请把 `stats.json` 里完整的丢弃分类贴上来补全账目**，
+重点看两个：
+
+| 类别 | 为什么要单独看 |
+|---|---|
+| **`worker_crash`** | 这不是「按规则筛掉」，是**处理时崩了整块跳过**（`prepare_v2_data.py:765` 把该块剩余全部计入）。**它必须是 0**；不是 0 就说明有数据是被异常吞掉的，得看日志里那条 `⚠ 分块 […] 处理中断` 是什么原因 |
+| **`empty_evidence` / `empty_reason`** | 这两类直接决定 instruct —— gemini 没给 evidence 或 reason 的样本没法构造 instruct，丢掉是对的。但数量能反映打标质量，值得记一笔 |
+
+其余几类（json 解析失败、字段缺失、空文本）数量小的话不用管。
+
+账目对齐后把这段替换成完整的 12 类表即可。
+
