@@ -1634,12 +1634,12 @@ pull 到这版后请把答案直接写在本节下面：
 
 ### 18.2 四步与预计耗时
 
-| 步 | 做什么 | 预计 | 崩了怎么办 |
-|---|---|---|---|
-| 1 | 数据准备（VAD） | 数小时 | `--skip-existing` 续跑 |
-| 2 | 抽 codes | 数小时 | 重跑同一条命令 |
-| 2.5 | 抽 spk（`--spk-only`） | **约 8h** | 重跑同一条命令 |
-| 3 | 训练（`SKIP_PREPARE=1`） | 19-21h | 权重级热启，**换新 `OUTPUT_DIR`** |
+| 步 | 做什么 | 预计 | 实测（2026-08-17） | 崩了怎么办 |
+|---|---|---|---|---|
+| 1 | 数据准备（VAD） | 数小时 | ✅ ~1.5h，train 432,211 + valid 500 | `--skip-existing` 续跑 |
+| 2 | 抽 codes | 数小时 | ✅ ~4h（含一次 OOM 修复重跑；batch 32→8 后通过） | 重跑同一条命令 |
+| 2.5 | 抽 spk（`--spk-only`） | **约 8h** | ✅ ~3.4h（28.4 ms/条，SFS 缓存热） | 重跑同一条命令 |
+| 3 | 训练（`SKIP_PREPARE=1`） | 19-21h | ⏳ 未启动 | 权重级热启，**换新 `OUTPUT_DIR`** |
 
 **第 3 步必须带 `SKIP_PREPARE=1`**，理由见 §11.3。
 
@@ -1687,3 +1687,9 @@ speaker 向量 (435000, 2048) ← .../spk.f16（drop_prob=0.0）
 4. chain watcher（`qwen_tts_exp/logs/chain_123.sh`）串联三步，中间校验
    wav_not_found/偏斜；教训：chain 脚本 `set -u` 会撞 CANN set_env.sh 的
    CMAKE_PREFIX_PATH 裸引用（§8.3 的坑第一次实际踩到）
+5. **全量筛选账目**（原始 497,780 → 保留 432,711，丢弃 65,069）：
+   `label_mismatch` **57,056**（88%；gemini 误拒 46,977 远多于漏拒 10,079，
+   与 data_report「gemini 偏保守」一致）/ `dup_uttid` 6,441（全在 car05）/
+   `missing_true_label` 438 / `vad_too_short` 96 / `partial_recovery` 38。
+   筛选后 reject 占比 28.7→23.1% / 34.9→29.1% / 48.6→45.1%，与 §11.1 预期吻合。
+   **训练集构成 = 打标与真值一致 + 去重 + 标签齐全 + VAD 后 ≥0.3s 人声**
