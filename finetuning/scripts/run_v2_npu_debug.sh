@@ -59,6 +59,8 @@ ATTN=${ATTN:-sdpa}
 DTYPE=${DTYPE:-fp32}
 # 每 N 步存一次。全量 1 epoch 是十几小时，只在 epoch 末落盘的话中途崩就全丢
 SAVE_EVERY=${SAVE_EVERY:-500}
+# 0 = 保留全部 step ckpt 不滚动清理（全量 54k 步 / SAVE_EVERY=3000 ≈ 18 个 × 4.3GB ≈ 77GB）
+SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-0}
 # 序列长度分桶：昇腾按形状编译算子，分桶让编译结果跨 step 复用（NPU 实测省 ~13%）
 LENGTH_BUCKET=${LENGTH_BUCKET:-64}
 # speaker 向量。SPK_MODEL_PATH 必须指向 **Base** 权重 —— speaker_encoder
@@ -130,6 +132,7 @@ echo ">>> 训练"
     --attn "$ATTN" \
     --dtype "$DTYPE" \
     --save-every "$SAVE_EVERY" \
+    --save-total-limit "$SAVE_TOTAL_LIMIT" \
     --length-bucket "$LENGTH_BUCKET" \
     --max_steps "$MAX_STEPS" \
     ${SPK_FILE:+--spk-file "$SPK_FILE" --spk-drop-prob "$SPK_DROP_PROB"} \
