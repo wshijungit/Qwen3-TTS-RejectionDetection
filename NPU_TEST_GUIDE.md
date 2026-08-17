@@ -1710,3 +1710,73 @@ speaker 向量 (435000, 2048) ← .../spk.f16（drop_prob=0.0）
 > 日志里会有对应的 `⚠ 分块 […] 处理中断`，说明数据准备有不稳定因素，
 > 下次重跑前值得查一下 —— 但对这次的 43 万条训练没有影响。
 
+
+## 19. 训完怎么测 —— 推理侧的 speaker 槽位
+
+### 19.1 为什么必须改推理
+
+训练带了 `--spk-file`，序列里就多一格 speaker。**推理不给这一格 = 训练中从未
+出现过的输入**：不报错，只表现为音色/音质乱。反过来给了没训过的 ckpt 也一样。
+
+原来的 `generate_voice_design(text, instruct, language)` 没有传向量的正式入口
+（只能手工拼 `voice_clone_prompt` 那个 dict），所以**训完没法测**。已加参数：
+
+```python
+wavs, sr = m.generate_voice_design(
+    text="打开空调", instruct="...", language="Chinese",
+    spk_embedding=vec,          # np.float32[2048] / torch tensor / 每条一个的 list
+)
+```
+
+内部会拼成 `voice_clone_prompt={"ref_spk_embedding": [...],
+"x_vector_only_mode": [True], "icl_mode": False, "ref_code": None}` ——
+`x_vector_only_mode` 必须 True 才会真的填进那一格（modeling:2149-2152），
+`icl_mode` 必须 False 否则会走 ICL 分支去要 ref_code（:2235），而 V2 没有参考音频。
+
+**三道防呆**（都已实测）：
+
+| 情况 | 行为 |
+|---|---|
+| ckpt 有 `v2_train_spk=True` 但不传 | **报错**，并说明「传全零」与「不传」不是一回事 |
+| 传了但 ckpt 没有 `v2_train_spk` | warning |
+| 向量不是 2048 维 | 报错，指出是第几条、多少维 |
+
+### 19.2 `eval_v2_spk.py` —— V2 效果就看这张表
+
+**V2 存在的意义**：真实数据里文本与拒识标签强相关（说"打开空调"基本都是对机的），
+拒识模型容易退化成背文本。V2 要做的是**同一句文本，两种腔调都合成一遍**。
+这个脚本就是验它成没成 —— 同一条 text × 对机/对人两种 instruct，
+**用同一个 spk 向量把音色摁住**，只剩腔调在变。
+
+```bash
+cd finetuning
+python eval_v2_spk.py --ckpt <训练产出的 ckpt> --device npu:0 \
+  --spk-source file:$E/qwen3_spk_emb/spk.f16:0 \
+  --out-dir $E/runs/eval_v2
+```
+
+`--spk-source` 三种：
+
+- `file:<spk.f16>[:行号]` —— 从全量抽好的向量里取一行（默认第 0 行）
+- `wav:<音频>` —— 现抽（要配 `--spk_model_path` 指 1.7B-Base）
+- `zero` —— 全零向量，即「只要 instruct 控制、不指定音色」
+
+产出每句两个 wav + `summary.json`（时长/能量），并打平均时长差。
+
+**怎么判读**：时长差是最容易自动看的代理指标（对机腔通常更短更利落），
+§11.2 的基线是不带 spk 34.6%、带 spk 29.8%。
+
+- 平均时长差仍是两位数 → instruct 通路正常
+- **掉到个位数 → 换 `--spk-source zero` 再跑一次**。若差异明显变大，
+  说明是 spk 那一格把 instruct 压过去了 —— 即 ref==target 的 shortcut
+  （模型从音色向量里读出了「这句原本怎么说的」，instruct 退化成摆设）。
+  真出现了，下一版把 spk 换成**同 session 平均向量**（sessionid 字段已确认存在，
+  §17.6 问题 1），平掉逐句韵律只留音色。
+
+**最终还是要听。** 时长差只是代理指标，不是结论。
+
+### 19.3 语言必须与训练一致
+
+脚本默认读 ckpt 里的 `v2_train_language`。训练 Chinese、推理 Auto 的话
+codec 前缀格数就对不上（5 格 vs 4 格），不报错但结果不对 —— 别手工传 `--language`
+除非你知道自己在干什么。

@@ -15,6 +15,7 @@
 # limitations under the License.
 import base64
 import io
+import warnings
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -640,6 +641,7 @@ class Qwen3TTSModel:
         instruct: Union[str, List[str]],
         language: Union[str, List[str]] = None,
         non_streaming_mode: bool = True,
+        spk_embedding=None,
         **kwargs,
     ) -> Tuple[List[np.ndarray], int]:
         """
@@ -716,16 +718,79 @@ class Qwen3TTSModel:
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
+        # ---- speaker 槽位（V2 微调加的，见 finetuning/dataset_voicedesign.py 文件头 §2）----
+        # 训练时若带了 --spk-file，序列里多一格 speaker；推理不给这一格走的是
+        # 完全没见过的输入 —— **不报错**，只表现为音色/音质乱。反过来也一样。
+        # 所以这里拿训练时写进 config 的 v2_train_spk 主动对一次。
+        trained_with_spk = bool(getattr(self.model.config, "v2_train_spk", False))
+        if spk_embedding is None and trained_with_spk:
+            raise ValueError(
+                "这个 checkpoint 是带 speaker 槽位训练的（config.v2_train_spk=True），"
+                "推理必须传 spk_embedding。\n"
+                "  - 想复刻某条音频的音色：用 finetuning/spk_encoder.py 抽它的向量\n"
+                "  - 只想要 instruct 控制、不在乎音色：传全零向量 "
+                "np.zeros(2048, dtype=np.float32)\n"
+                "  （注意「传全零」和「不传」不是一回事：不传是 5 格块，"
+                f"训练时是 6 格块。drop_prob="
+                f"{getattr(self.model.config, 'v2_train_spk_drop_prob', 0)}）")
+        if spk_embedding is not None and not trained_with_spk:
+            warnings.warn(
+                "传了 spk_embedding，但 config 里没有 v2_train_spk=True —— "
+                "这个 checkpoint 多半没学过 speaker 那一格，结果可能不对。",
+                RuntimeWarning, stacklevel=2)
+
+        voice_clone_prompt = None
+        if spk_embedding is not None:
+            embs = self._normalize_spk_embedding(spk_embedding, len(texts))
+            voice_clone_prompt = {
+                "ref_spk_embedding": embs,
+                # x_vector_only_mode=True 才会真的把向量填进 speaker 那一格
+                # （modeling:2149-2152）；icl_mode 必须 False，否则会走 ICL 分支
+                # 去要 ref_code（modeling:2235），而 V2 没有参考音频
+                "x_vector_only_mode": [True] * len(texts),
+                "icl_mode": [False] * len(texts),
+                "ref_code": None,
+            }
+
         talker_codes_list, _ = self.model.generate(
             input_ids=input_ids,
             instruct_ids=instruct_ids,
             languages=languages,
             non_streaming_mode=non_streaming_mode,
+            voice_clone_prompt=voice_clone_prompt,
             **gen_kwargs,
         )
 
         wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
         return wavs, fs
+
+    def _normalize_spk_embedding(self, spk, n):
+        """把 numpy / torch / list 统一成 n 个 [2048] 的 talker dtype 张量。"""
+        if isinstance(spk, np.ndarray):
+            spk = torch.from_numpy(spk)
+        if torch.is_tensor(spk):
+            if spk.dim() == 1:
+                spk = [spk] * n
+            elif spk.dim() == 2:
+                spk = [spk[i] for i in range(spk.shape[0])]
+            else:
+                raise ValueError(f"spk_embedding 维度应为 1 或 2，收到 {spk.dim()}")
+        out = []
+        for v in spk:
+            if isinstance(v, np.ndarray):
+                v = torch.from_numpy(v)
+            v = v.reshape(-1)
+            # fp16 存盘的向量直接喂进 talker 会 dtype 不匹配；统一转成 talker 的 dtype
+            out.append(v.to(device=self.model.talker.device, dtype=self.model.talker.dtype))
+        if len(out) == 1 and n > 1:
+            out = out * n
+        if len(out) != n:
+            raise ValueError(f"spk_embedding 给了 {len(out)} 条，但 text 有 {n} 条")
+        bad = [i for i, v in enumerate(out) if v.numel() != 2048]
+        if bad:
+            raise ValueError(f"spk_embedding 第 {bad[:3]} 条不是 2048 维："
+                             f"{[out[i].numel() for i in bad[:3]]}")
+        return out
 
     # custom voice model
     @torch.no_grad()
