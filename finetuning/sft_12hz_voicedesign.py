@@ -104,11 +104,13 @@ class V2TrainStep(torch.nn.Module):
         with acc.autocast(): talker(x) -> bf16
     """
 
-    def __init__(self, qwen_model, sub_talker_weight, spk_drop_prob=0.0):
+    def __init__(self, qwen_model, sub_talker_weight, spk_drop_prob=0.0,
+                 sub_talker_frame_bucket=0):
         super().__init__()
         self.model = qwen_model
         self.sub_talker_weight = sub_talker_weight
         self.spk_drop_prob = spk_drop_prob
+        self.sub_talker_frame_bucket = sub_talker_frame_bucket
 
     def forward(self, input_ids, codec_ids, text_embedding_mask,
                 codec_embedding_mask, attention_mask, codec_0_labels, codec_mask,
@@ -153,21 +155,46 @@ class V2TrainStep(torch.nn.Module):
         )
         hidden_states = outputs.hidden_states[0][-1]
         return outputs.loss + self.sub_talker_weight * _sub_talker_loss(
-            talker, codec_ids, codec_mask, hidden_states
+            talker, codec_ids, codec_mask, hidden_states,
+            frame_bucket=self.sub_talker_frame_bucket,
         )
 
 
-def _sub_talker_loss(talker, codec_ids, codec_mask, hidden_states):
+def _sub_talker_loss(talker, codec_ids, codec_mask, hidden_states, frame_bucket=0):
     """sub-talker（1..15 号码本）的 loss。
 
     label 在 collate 里已左移一格，这里对应地用 hidden[:-1] 预测 codec[1:]。
+
+    **frame_bucket：把帧数向上取整到它的倍数**（0/1 = 关闭，保持原行为）。
+
+    为什么需要：`hidden_states[:, :-1][target]` 是布尔掩码索引，产出
+    `[N_frames, hidden]` —— N_frames 是这一批音频的**实际总帧数**，与主路径的
+    LENGTH_BUCKET 无关，**完全没有分桶**。按真实时长分布估算（batch=8），
+    54000 步里会出现约 **524 种不同形状**，而昇腾按形状编译算子，
+    每种形状要单独编一次内核并占一份 workspace。
+    524 > 默认 `ACLNN_CACHE_LIMIT=300`，缓存还会颠簸 —— 这与 NPU 侧观察到的
+    「~7MB/步 稳定泄漏、与 sdpa/eager 无关、CUDA 上复现不了」完全吻合。
+    分桶到 64 的倍数后形状降到 **12 种**。
+
+    padding 行对 loss **零影响**：codec_ids 那份补 0（embedding 查表需要合法
+    下标，不能填 -100），labels 那份补 -100，而 `_compute_token_ce_loss` 用的是
+    `ignore_index=-100` + `reduction='mean'`，被忽略的项分子分母都不计入。
     """
     target = codec_mask[:, 1:]
     hs = hidden_states[:, :-1][target]
     ids = codec_ids[:, 1:][target]
     if hs.numel() == 0 or ids.numel() == 0:
         return hidden_states.new_zeros(())
-    _, loss = talker.forward_sub_talker_finetune(ids, hs)
+    labels = None
+    if frame_bucket and frame_bucket > 1:
+        pad = (-hs.shape[0]) % frame_bucket
+        if pad:
+            hs = torch.cat([hs, hs.new_zeros(pad, hs.shape[1])], dim=0)
+            ids = torch.cat([ids, ids.new_zeros(pad, ids.shape[1])], dim=0)
+        labels = ids[:, 1:].clone()
+        if pad:
+            labels[-pad:] = -100
+    _, loss = talker.forward_sub_talker_finetune(ids, hs, labels=labels)
     return loss
 
 
@@ -214,6 +241,14 @@ def train():
              "用 8 位尾数累积梯度平方，lr 2e-5 下更新量有下溢风险；"
              "fp32 = fp32 权重 + autocast bf16 计算（标准混合精度），静态约 25GiB，"
              "910B2 的 64GB 吃得下，收敛更稳。显存不紧就用 fp32")
+    parser.add_argument(
+        "--sub-talker-frame-bucket", type=int, default=0,
+        help="把 sub-talker 的帧数向上取整到该倍数（0=关闭）。"
+             "sub-talker 走布尔掩码索引，形状 = 这批音频的实际总帧数，"
+             "与 --length-bucket 无关、完全动态：batch=8 下约 524 种形状，"
+             "超过默认 ACLNN_CACHE_LIMIT=300。昇腾按形状编译算子，"
+             "这是 NPU 侧「~7MB/步 显存泄漏」的头号嫌疑。设 64 可降到 12 种。"
+             "padding 行 label 填 -100，对 loss 零影响（已实测逐位相同）")
     parser.add_argument(
         "--spk-file", type=str, default=None,
         help="prepare_data.py --spk_out 产出的裸 fp16 文件（[N,2048]，行与 train_jsonl 逐行对应）。"
@@ -266,7 +301,8 @@ def train():
                                   collate_fn=dataset.collate_fn)
 
     step_module = V2TrainStep(qwen3tts.model, args.sub_talker_loss_weight,
-                              spk_drop_prob=args.spk_drop_prob)
+                              spk_drop_prob=args.spk_drop_prob,
+                              sub_talker_frame_bucket=args.sub_talker_frame_bucket)
     optimizer = AdamW(step_module.parameters(), lr=args.lr, weight_decay=0.01)
     model, optimizer, train_dataloader = accelerator.prepare(
         step_module, optimizer, train_dataloader

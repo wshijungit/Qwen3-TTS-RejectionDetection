@@ -1,0 +1,412 @@
+[
+ {
+  "md_name": "04df720c7f90418e9890343bdfed6931.wav",
+  "file": "04df720c7f90418e9890343bdfed6931.mp3",
+  "ref_text": "要这个要",
+  "html_card": "s05",
+  "session": "75eb6c80-255f-415d-b3b9-bf8b24be569f__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 6,
+  "bytes": 66312
+ },
+ {
+  "md_name": "0856cebad087499fa3bb0a03d3212c39.wav",
+  "file": "0856cebad087499fa3bb0a03d3212c39.mp3",
+  "ref_text": "就是开心",
+  "html_card": "s05",
+  "session": "75eb6c80-255f-415d-b3b9-bf8b24be569f__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 2,
+  "bytes": 14256
+ },
+ {
+  "md_name": "09033d6a2cb14c849d335da21e9214fa.wav",
+  "file": "09033d6a2cb14c849d335da21e9214fa.mp3",
+  "ref_text": "打开大灯",
+  "html_card": "s12",
+  "session": "2b110b1d-a067-4e5b-99a0-e77504459f94__chunk001",
+  "pool": "car_all_0415_0424",
+  "turn": 3,
+  "bytes": 36720
+ },
+ {
+  "md_name": "0ca74285cf3a41388db1566efc335268.wav",
+  "file": "0ca74285cf3a41388db1566efc335268.mp3",
+  "ref_text": "走两步，走两步",
+  "html_card": "s01",
+  "session": "61a59035-16ae-4c5b-b839-3afb7f3b2843__chunk002",
+  "pool": "CC_new_0701_0730",
+  "turn": 3,
+  "bytes": 51840
+ },
+ {
+  "md_name": "212a12b107fa4461a671226b0c4c73fb.wav",
+  "file": "212a12b107fa4461a671226b0c4c73fb.mp3",
+  "ref_text": "你可以嗰个车窗呢？你可以用只手去拨一拨佢，就是这样摸一下，这样",
+  "html_card": "s14",
+  "session": "de48a8f4-7dde-4514-8a46-1c5c41661f46__chunk001",
+  "pool": "CC_new_0601_0630",
+  "turn": 5,
+  "bytes": 33696
+ },
+ {
+  "md_name": "232392749cb44612803b97d61988d065.wav",
+  "file": "232392749cb44612803b97d61988d065.mp3",
+  "ref_text": "我专门给他调的四川话，他给我说的是成都话",
+  "html_card": "s13",
+  "session": "556e73d8-b8a0-4720-9633-d822a0929902__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 8,
+  "bytes": 39096
+ },
+ {
+  "md_name": "237e49669f8444b48063ae2ab2474b62.wav",
+  "file": "237e49669f8444b48063ae2ab2474b62.mp3",
+  "ref_text": "那个车是我同事的吧3025",
+  "html_card": "s09",
+  "session": "2b2e9726-c05d-4c2a-a10a-1f663a1af6c3__chunk001",
+  "pool": "car_all_0415_0424",
+  "turn": 2,
+  "bytes": 23976
+ },
+ {
+  "md_name": "277e8927adab44029c10141f7e49b467.wav",
+  "file": "277e8927adab44029c10141f7e49b467.mp3",
+  "ref_text": "可把阿超看得一头雾水，而还不等他反应过来",
+  "html_card": "s07",
+  "session": "491d1726-7554-4f6c-9c0f-91ae4d68786a__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 3,
+  "bytes": 24624
+ },
+ {
+  "md_name": "31224840080e4db68114af17b9f55c7b.wav",
+  "file": "31224840080e4db68114af17b9f55c7b.mp3",
+  "ref_text": "你有冇睇到佢清晰度啊，系咪有啲",
+  "html_card": "s14",
+  "session": "de48a8f4-7dde-4514-8a46-1c5c41661f46__chunk001",
+  "pool": "CC_new_0601_0630",
+  "turn": 2,
+  "bytes": 59184
+ },
+ {
+  "md_name": "38f42a1f57ec4c6e960ce68f0fd6de61.wav",
+  "file": "38f42a1f57ec4c6e960ce68f0fd6de61.mp3",
+  "ref_text": "多反而露出了一抹笑容",
+  "html_card": "s07",
+  "session": "491d1726-7554-4f6c-9c0f-91ae4d68786a__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 2,
+  "bytes": 65880
+ },
+ {
+  "md_name": "3aba944b926742c093315f57cf4ac9f1.wav",
+  "file": "3aba944b926742c093315f57cf4ac9f1.mp3",
+  "ref_text": "小艺小艺",
+  "html_card": "s09",
+  "session": "2b2e9726-c05d-4c2a-a10a-1f663a1af6c3__chunk001",
+  "pool": "car_all_0415_0424",
+  "turn": 3,
+  "bytes": 17064
+ },
+ {
+  "md_name": "3b0795bcdd1a4c8192b60028fc50f2c0.wav",
+  "file": "3b0795bcdd1a4c8192b60028fc50f2c0.mp3",
+  "ref_text": "哦，开起来，我错怪他了",
+  "html_card": "s13",
+  "session": "556e73d8-b8a0-4720-9633-d822a0929902__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 4,
+  "bytes": 26136
+ },
+ {
+  "md_name": "4186d0abc8eb4665a38b8878075ca859.wav",
+  "file": "4186d0abc8eb4665a38b8878075ca859.mp3",
+  "ref_text": "往往上给他们",
+  "html_card": "s14",
+  "session": "de48a8f4-7dde-4514-8a46-1c5c41661f46__chunk001",
+  "pool": "CC_new_0601_0630",
+  "turn": 7,
+  "bytes": 19656
+ },
+ {
+  "md_name": "42156a23fe9a451ba9992fd2caf2838b.wav",
+  "file": "42156a23fe9a451ba9992fd2caf2838b.mp3",
+  "ref_text": "导航重庆大剧院",
+  "html_card": "s08",
+  "session": "1b54c12f-3dea-4d9e-acd0-470e8717792f__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 18576
+ },
+ {
+  "md_name": "43e738e0c89a42e68c908a17bef27462.wav",
+  "file": "43e738e0c89a42e68c908a17bef27462.mp3",
+  "ref_text": "以前我们那车都是没得座椅通风，龟儿老子夏天开车开起屁股巴钱",
+  "html_card": "s13",
+  "session": "556e73d8-b8a0-4720-9633-d822a0929902__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 5,
+  "bytes": 39096
+ },
+ {
+  "md_name": "5879961b6b72418f850000c36bcc82dc.wav",
+  "file": "5879961b6b72418f850000c36bcc82dc.mp3",
+  "ref_text": "哎呀，啪啪啪啪啪",
+  "html_card": "s13",
+  "session": "556e73d8-b8a0-4720-9633-d822a0929902__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 7,
+  "bytes": 34344
+ },
+ {
+  "md_name": "5ba8434c811648e8a7bfb2a2198990b3.wav",
+  "file": "5ba8434c811648e8a7bfb2a2198990b3.mp3",
+  "ref_text": "副驾的座椅通风",
+  "html_card": "s13",
+  "session": "556e73d8-b8a0-4720-9633-d822a0929902__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 3,
+  "bytes": 31320
+ },
+ {
+  "md_name": "5d8bbe68a816423497dd9d64ed4f2c03.wav",
+  "file": "5d8bbe68a816423497dd9d64ed4f2c03.mp3",
+  "ref_text": "结果是啥呀",
+  "html_card": "s07",
+  "session": "491d1726-7554-4f6c-9c0f-91ae4d68786a__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 6,
+  "bytes": 9504
+ },
+ {
+  "md_name": "66ceb60974a3415697aa95cf34603d7d.wav",
+  "file": "66ceb60974a3415697aa95cf34603d7d.mp3",
+  "ref_text": "二排左车窗打了吗",
+  "html_card": "s15",
+  "session": "edf81997-070d-4a9a-b06a-6b6c4d0e1b44__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 2,
+  "bytes": 70632
+ },
+ {
+  "md_name": "6845635ed56041d9bdf39155d4a30f17.wav",
+  "file": "6845635ed56041d9bdf39155d4a30f17.mp3",
+  "ref_text": "它比较智能的话，我转弯，它这个椅子会自动一个把手给你扶到起，身体都不太倾斜",
+  "html_card": "s05",
+  "session": "75eb6c80-255f-415d-b3b9-bf8b24be569f__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 4,
+  "bytes": 49032
+ },
+ {
+  "md_name": "77cf50dfbb924214aac574c643a14f44.wav",
+  "file": "77cf50dfbb924214aac574c643a14f44.mp3",
+  "ref_text": "只有那张就行了，那张原图。哎，你们就发我等下儿发给他，留个记念，搞嘛",
+  "html_card": "s08",
+  "session": "1b54c12f-3dea-4d9e-acd0-470e8717792f__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 4,
+  "bytes": 37800
+ },
+ {
+  "md_name": "8221bd89981c4ef795bdceb9934abf7a.wav",
+  "file": "8221bd89981c4ef795bdceb9934abf7a.mp3",
+  "ref_text": "谢谢你",
+  "html_card": "s08",
+  "session": "1b54c12f-3dea-4d9e-acd0-470e8717792f__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 5,
+  "bytes": 19440
+ },
+ {
+  "md_name": "896b3a30c6f4462fa6a628edd9226171.wav",
+  "file": "896b3a30c6f4462fa6a628edd9226171.mp3",
+  "ref_text": "哎，兄弟，哪个哪个有专项证？看那个的嘛，是不是？我跟他们说嘛，说该设置设置，但是说老实话，涉及到那个位置检测线的，你有些时候弄40他是肯定不够，我没跟你讲，因为现在现在的要求就是好像是不低于40",
+  "html_card": "s01",
+  "session": "61a59035-16ae-4c5b-b839-3afb7f3b2843__chunk002",
+  "pool": "CC_new_0701_0730",
+  "turn": 2,
+  "bytes": 111024
+ },
+ {
+  "md_name": "898746391cf947f3aee2dffcb7f1ff3f.wav",
+  "file": "898746391cf947f3aee2dffcb7f1ff3f.mp3",
+  "ref_text": "打开360全景",
+  "html_card": "s05",
+  "session": "75eb6c80-255f-415d-b3b9-bf8b24be569f__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 19440
+ },
+ {
+  "md_name": "8b961c8bc5ef4e1ba8dba6007c06eb77.wav",
+  "file": "8b961c8bc5ef4e1ba8dba6007c06eb77.mp3",
+  "ref_text": "打开座椅，副驾座椅通风",
+  "html_card": "s13",
+  "session": "556e73d8-b8a0-4720-9633-d822a0929902__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 28080
+ },
+ {
+  "md_name": "8d7f71c5621841179860eefbc8a6e254.wav",
+  "file": "8d7f71c5621841179860eefbc8a6e254.mp3",
+  "ref_text": "我操，不是这凯迪拉克，我还想撞我呀",
+  "html_card": "s10",
+  "session": "4d610a72-79ab-4835-addf-d9ee8bea7db6__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 4,
+  "bytes": 36288
+ },
+ {
+  "md_name": "91daf44a60cd409bad23a3685d363e49.wav",
+  "file": "91daf44a60cd409bad23a3685d363e49.mp3",
+  "ref_text": "他也冇去哦",
+  "html_card": "s14",
+  "session": "de48a8f4-7dde-4514-8a46-1c5c41661f46__chunk001",
+  "pool": "CC_new_0601_0630",
+  "turn": 4,
+  "bytes": 14688
+ },
+ {
+  "md_name": "99bf597d505f4a0e997a1ef558b80d53.wav",
+  "file": "99bf597d505f4a0e997a1ef558b80d53.mp3",
+  "ref_text": "你抛弃到不老不恼火",
+  "html_card": "s02",
+  "session": "e6894fc1-276d-4f2d-b268-e77e75895b77__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 20304
+ },
+ {
+  "md_name": "99ec42ad5c6e41e59f7dfdef11528136.wav",
+  "file": "99ec42ad5c6e41e59f7dfdef11528136.mp3",
+  "ref_text": "拍个照吧",
+  "html_card": "s04",
+  "session": "d1a6a137-4ef1-43e6-a7dd-f90159ebfb38__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 20520
+ },
+ {
+  "md_name": "a0990bdbce6d4b44a6f9889f3f6950b3.wav",
+  "file": "a0990bdbce6d4b44a6f9889f3f6950b3.mp3",
+  "ref_text": "把所有把那个主驾副驾，还有我后头那个座椅，座椅按摩加起",
+  "html_card": "s13",
+  "session": "556e73d8-b8a0-4720-9633-d822a0929902__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 9,
+  "bytes": 82944
+ },
+ {
+  "md_name": "a7a8361dcefc431fa6cd9a094419fe75.wav",
+  "file": "a7a8361dcefc431fa6cd9a094419fe75.mp3",
+  "ref_text": "嗯，中午他再去打个卡，然后下午点儿我们就开车上去，然后吃了饭，晚上开车回来",
+  "html_card": "s02",
+  "session": "e6894fc1-276d-4f2d-b268-e77e75895b77__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 3,
+  "bytes": 55296
+ },
+ {
+  "md_name": "abc357455dff4ad29fc4f4dbb0ececd8.wav",
+  "file": "abc357455dff4ad29fc4f4dbb0ececd8.mp3",
+  "ref_text": "如何在如何在10天之内减10斤",
+  "html_card": "s06",
+  "session": "3a92d405-d225-45cd-98b1-f1e5f21fe8df__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 39744
+ },
+ {
+  "md_name": "b62dfaba103647ef98a73b7e3da203ae.wav",
+  "file": "b62dfaba103647ef98a73b7e3da203ae.mp3",
+  "ref_text": "退出小憩模式",
+  "html_card": "s11",
+  "session": "e72d3fb5-abf1-40ab-aafa-515e7fa4a3de__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 16632
+ },
+ {
+  "md_name": "ba9ebaa6a50c4964800f1f445556c701.wav",
+  "file": "ba9ebaa6a50c4964800f1f445556c701.mp3",
+  "ref_text": "二排空调调到2档",
+  "html_card": "s07",
+  "session": "491d1726-7554-4f6c-9c0f-91ae4d68786a__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 18792
+ },
+ {
+  "md_name": "c55d188583e8430580c106248242c64e.wav",
+  "file": "c55d188583e8430580c106248242c64e.mp3",
+  "ref_text": "后排小孩有点闹腾，确认下后车门儿童锁锁了没",
+  "html_card": "s15",
+  "session": "edf81997-070d-4a9a-b06a-6b6c4d0e1b44__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 41256
+ },
+ {
+  "md_name": "d165297e45764d70a984a3cd544cf1b1.wav",
+  "file": "d165297e45764d70a984a3cd544cf1b1.mp3",
+  "ref_text": "已经我已经告诉你了，厂不在",
+  "html_card": "s04",
+  "session": "d1a6a137-4ef1-43e6-a7dd-f90159ebfb38__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 5,
+  "bytes": 32400
+ },
+ {
+  "md_name": "d1f5755ea4e444c5ae957f7382212f59.wav",
+  "file": "d1f5755ea4e444c5ae957f7382212f59.mp3",
+  "ref_text": "空调温度同步",
+  "html_card": "s10",
+  "session": "4d610a72-79ab-4835-addf-d9ee8bea7db6__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 1,
+  "bytes": 18144
+ },
+ {
+  "md_name": "e94518dd166043fcba46b963d277271d.wav",
+  "file": "e94518dd166043fcba46b963d277271d.mp3",
+  "ref_text": "收起幕布",
+  "html_card": "s14",
+  "session": "de48a8f4-7dde-4514-8a46-1c5c41661f46__chunk001",
+  "pool": "CC_new_0601_0630",
+  "turn": 1,
+  "bytes": 16416
+ },
+ {
+  "md_name": "ecc7c8c453d44410a583ba73417e2447.wav",
+  "file": "ecc7c8c453d44410a583ba73417e2447.mp3",
+  "ref_text": "我们还有点血缘关系",
+  "html_card": "s11",
+  "session": "e72d3fb5-abf1-40ab-aafa-515e7fa4a3de__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 4,
+  "bytes": 17712
+ },
+ {
+  "md_name": "ed174465e6484de68a272c97ee0583e3.wav",
+  "file": "ed174465e6484de68a272c97ee0583e3.mp3",
+  "ref_text": "得行了",
+  "html_card": "s05",
+  "session": "75eb6c80-255f-415d-b3b9-bf8b24be569f__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 3,
+  "bytes": 9720
+ },
+ {
+  "md_name": "f26882db5724430b84185d69dd619b65.wav",
+  "file": "f26882db5724430b84185d69dd619b65.mp3",
+  "ref_text": "我发现你畀条威我嘅胃啊",
+  "html_card": "s04",
+  "session": "d1a6a137-4ef1-43e6-a7dd-f90159ebfb38__chunk001",
+  "pool": "CC_new_0701_0730",
+  "turn": 3,
+  "bytes": 31968
+ }
+]

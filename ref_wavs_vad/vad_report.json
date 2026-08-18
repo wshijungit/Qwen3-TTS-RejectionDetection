@@ -1,0 +1,371 @@
+[
+ {
+  "src": "04df720c7f90418e9890343bdfed6931.mp3",
+  "out": "04df720c7f90418e9890343bdfed6931.wav",
+  "sec_before": 11.05,
+  "sec_after": 1.68,
+  "segments": 2,
+  "voiced_sec": 1.06,
+  "cut_sec": 9.37
+ },
+ {
+  "src": "0856cebad087499fa3bb0a03d3212c39.mp3",
+  "out": "0856cebad087499fa3bb0a03d3212c39.wav",
+  "sec_before": 2.38,
+  "sec_after": 1.69,
+  "segments": 2,
+  "voiced_sec": 1.09,
+  "cut_sec": 0.69
+ },
+ {
+  "src": "09033d6a2cb14c849d335da21e9214fa.mp3",
+  "out": "09033d6a2cb14c849d335da21e9214fa.wav",
+  "sec_before": 6.12,
+  "sec_after": 1.16,
+  "segments": 1,
+  "voiced_sec": 0.9,
+  "cut_sec": 4.96
+ },
+ {
+  "src": "0ca74285cf3a41388db1566efc335268.mp3",
+  "out": "0ca74285cf3a41388db1566efc335268.wav",
+  "sec_before": 8.64,
+  "sec_after": 1.87,
+  "segments": 2,
+  "voiced_sec": 1.25,
+  "cut_sec": 6.77
+ },
+ {
+  "src": "212a12b107fa4461a671226b0c4c73fb.mp3",
+  "out": "212a12b107fa4461a671226b0c4c73fb.wav",
+  "sec_before": 5.62,
+  "sec_after": 5.48,
+  "segments": 4,
+  "voiced_sec": 4.38,
+  "cut_sec": 0.14
+ },
+ {
+  "src": "232392749cb44612803b97d61988d065.mp3",
+  "out": "232392749cb44612803b97d61988d065.wav",
+  "sec_before": 6.52,
+  "sec_after": 3.33,
+  "segments": 2,
+  "voiced_sec": 2.91,
+  "cut_sec": 3.19
+ },
+ {
+  "src": "237e49669f8444b48063ae2ab2474b62.mp3",
+  "out": "237e49669f8444b48063ae2ab2474b62.wav",
+  "sec_before": 4.0,
+  "sec_after": 2.5,
+  "segments": 1,
+  "voiced_sec": 2.24,
+  "cut_sec": 1.5
+ },
+ {
+  "src": "277e8927adab44029c10141f7e49b467.mp3",
+  "out": "277e8927adab44029c10141f7e49b467.wav",
+  "sec_before": 4.1,
+  "sec_after": 4.3,
+  "segments": 2,
+  "voiced_sec": 4.0,
+  "cut_sec": -0.2
+ },
+ {
+  "src": "31224840080e4db68114af17b9f55c7b.mp3",
+  "out": "31224840080e4db68114af17b9f55c7b.wav",
+  "sec_before": 9.86,
+  "sec_after": 2.5,
+  "segments": 1,
+  "voiced_sec": 2.24,
+  "cut_sec": 7.36
+ },
+ {
+  "src": "38f42a1f57ec4c6e960ce68f0fd6de61.mp3",
+  "out": "38f42a1f57ec4c6e960ce68f0fd6de61.wav",
+  "sec_before": 10.98,
+  "sec_after": 9.76,
+  "segments": 15,
+  "voiced_sec": 6.24,
+  "cut_sec": 1.22
+ },
+ {
+  "src": "3aba944b926742c093315f57cf4ac9f1.mp3",
+  "out": "3aba944b926742c093315f57cf4ac9f1.wav",
+  "sec_before": 2.84,
+  "sec_after": 1.06,
+  "segments": 1,
+  "voiced_sec": 0.8,
+  "cut_sec": 1.78
+ },
+ {
+  "src": "3b0795bcdd1a4c8192b60028fc50f2c0.mp3",
+  "out": "3b0795bcdd1a4c8192b60028fc50f2c0.wav",
+  "sec_before": 4.36,
+  "sec_after": 1.73,
+  "segments": 1,
+  "voiced_sec": 1.47,
+  "cut_sec": 2.63
+ },
+ {
+  "src": "4186d0abc8eb4665a38b8878075ca859.mp3",
+  "out": "4186d0abc8eb4665a38b8878075ca859.wav",
+  "sec_before": 3.28,
+  "sec_after": 2.18,
+  "segments": 4,
+  "voiced_sec": 1.38,
+  "cut_sec": 1.1
+ },
+ {
+  "src": "42156a23fe9a451ba9992fd2caf2838b.mp3",
+  "out": "42156a23fe9a451ba9992fd2caf2838b.wav",
+  "sec_before": 3.1,
+  "sec_after": 1.44,
+  "segments": 1,
+  "voiced_sec": 1.18,
+  "cut_sec": 1.66
+ },
+ {
+  "src": "43e738e0c89a42e68c908a17bef27462.mp3",
+  "out": "43e738e0c89a42e68c908a17bef27462.wav",
+  "sec_before": 6.52,
+  "sec_after": 4.56,
+  "segments": 2,
+  "voiced_sec": 4.02,
+  "cut_sec": 1.96
+ },
+ {
+  "src": "5879961b6b72418f850000c36bcc82dc.mp3",
+  "out": "5879961b6b72418f850000c36bcc82dc.wav",
+  "sec_before": 5.72,
+  "sec_after": 1.84,
+  "segments": 3,
+  "voiced_sec": 1.06,
+  "cut_sec": 3.88
+ },
+ {
+  "src": "5ba8434c811648e8a7bfb2a2198990b3.mp3",
+  "out": "5ba8434c811648e8a7bfb2a2198990b3.wav",
+  "sec_before": 5.22,
+  "sec_after": 1.7,
+  "segments": 2,
+  "voiced_sec": 1.22,
+  "cut_sec": 3.52
+ },
+ {
+  "src": "5d8bbe68a816423497dd9d64ed4f2c03.mp3",
+  "out": "5d8bbe68a816423497dd9d64ed4f2c03.wav",
+  "sec_before": 1.58,
+  "sec_after": 1.24,
+  "segments": 1,
+  "voiced_sec": 1.02,
+  "cut_sec": 0.34
+ },
+ {
+  "src": "66ceb60974a3415697aa95cf34603d7d.mp3",
+  "out": "66ceb60974a3415697aa95cf34603d7d.wav",
+  "sec_before": 11.77,
+  "sec_after": 1.51,
+  "segments": 1,
+  "voiced_sec": 1.25,
+  "cut_sec": 10.26
+ },
+ {
+  "src": "6845635ed56041d9bdf39155d4a30f17.mp3",
+  "out": "6845635ed56041d9bdf39155d4a30f17.wav",
+  "sec_before": 8.17,
+  "sec_after": 6.15,
+  "segments": 4,
+  "voiced_sec": 5.41,
+  "cut_sec": 2.02
+ },
+ {
+  "src": "77cf50dfbb924214aac574c643a14f44.mp3",
+  "out": "77cf50dfbb924214aac574c643a14f44.wav",
+  "sec_before": 6.3,
+  "sec_after": 5.87,
+  "segments": 4,
+  "voiced_sec": 5.02,
+  "cut_sec": 0.43
+ },
+ {
+  "src": "8221bd89981c4ef795bdceb9934abf7a.mp3",
+  "out": "8221bd89981c4ef795bdceb9934abf7a.wav",
+  "sec_before": 3.24,
+  "sec_after": 0.76,
+  "segments": 1,
+  "voiced_sec": 0.54,
+  "cut_sec": 2.48
+ },
+ {
+  "src": "896b3a30c6f4462fa6a628edd9226171.mp3",
+  "out": "896b3a30c6f4462fa6a628edd9226171.wav",
+  "sec_before": 18.5,
+  "sec_after": 15.92,
+  "segments": 10,
+  "voiced_sec": 13.76,
+  "cut_sec": 2.58
+ },
+ {
+  "src": "898746391cf947f3aee2dffcb7f1ff3f.mp3",
+  "out": "898746391cf947f3aee2dffcb7f1ff3f.wav",
+  "sec_before": 3.24,
+  "sec_after": 1.73,
+  "segments": 1,
+  "voiced_sec": 1.47,
+  "cut_sec": 1.51
+ },
+ {
+  "src": "8b961c8bc5ef4e1ba8dba6007c06eb77.mp3",
+  "out": "8b961c8bc5ef4e1ba8dba6007c06eb77.wav",
+  "sec_before": 4.68,
+  "sec_after": 3.56,
+  "segments": 3,
+  "voiced_sec": 2.59,
+  "cut_sec": 1.12
+ },
+ {
+  "src": "8d7f71c5621841179860eefbc8a6e254.mp3",
+  "out": "8d7f71c5621841179860eefbc8a6e254.wav",
+  "sec_before": 6.05,
+  "sec_after": 3.43,
+  "segments": 3,
+  "voiced_sec": 2.75,
+  "cut_sec": 2.62
+ },
+ {
+  "src": "91daf44a60cd409bad23a3685d363e49.mp3",
+  "out": "91daf44a60cd409bad23a3685d363e49.wav",
+  "sec_before": 2.45,
+  "sec_after": 1.93,
+  "segments": 2,
+  "voiced_sec": 1.39,
+  "cut_sec": 0.52
+ },
+ {
+  "src": "99bf597d505f4a0e997a1ef558b80d53.mp3",
+  "out": "99bf597d505f4a0e997a1ef558b80d53.wav",
+  "sec_before": 3.38,
+  "sec_after": 3.61,
+  "segments": 2,
+  "voiced_sec": 3.32,
+  "cut_sec": -0.23
+ },
+ {
+  "src": "99ec42ad5c6e41e59f7dfdef11528136.mp3",
+  "out": "99ec42ad5c6e41e59f7dfdef11528136.wav",
+  "sec_before": 3.42,
+  "sec_after": 1.03,
+  "segments": 1,
+  "voiced_sec": 0.77,
+  "cut_sec": 2.39
+ },
+ {
+  "src": "a0990bdbce6d4b44a6f9889f3f6950b3.mp3",
+  "out": "a0990bdbce6d4b44a6f9889f3f6950b3.wav",
+  "sec_before": 13.82,
+  "sec_after": 6.05,
+  "segments": 5,
+  "voiced_sec": 5.15,
+  "cut_sec": 7.77
+ },
+ {
+  "src": "a7a8361dcefc431fa6cd9a094419fe75.mp3",
+  "out": "a7a8361dcefc431fa6cd9a094419fe75.wav",
+  "sec_before": 9.22,
+  "sec_after": 8.63,
+  "segments": 2,
+  "voiced_sec": 8.19,
+  "cut_sec": 0.59
+ },
+ {
+  "src": "abc357455dff4ad29fc4f4dbb0ececd8.mp3",
+  "out": "abc357455dff4ad29fc4f4dbb0ececd8.wav",
+  "sec_before": 6.62,
+  "sec_after": 4.77,
+  "segments": 5,
+  "voiced_sec": 3.65,
+  "cut_sec": 1.85
+ },
+ {
+  "src": "b62dfaba103647ef98a73b7e3da203ae.mp3",
+  "out": "b62dfaba103647ef98a73b7e3da203ae.wav",
+  "sec_before": 2.77,
+  "sec_after": 1.28,
+  "segments": 1,
+  "voiced_sec": 1.02,
+  "cut_sec": 1.49
+ },
+ {
+  "src": "ba9ebaa6a50c4964800f1f445556c701.mp3",
+  "out": "ba9ebaa6a50c4964800f1f445556c701.wav",
+  "sec_before": 3.13,
+  "sec_after": 1.7,
+  "segments": 1,
+  "voiced_sec": 1.44,
+  "cut_sec": 1.43
+ },
+ {
+  "src": "c55d188583e8430580c106248242c64e.mp3",
+  "out": "c55d188583e8430580c106248242c64e.wav",
+  "sec_before": 6.88,
+  "sec_after": 4.36,
+  "segments": 3,
+  "voiced_sec": 3.58,
+  "cut_sec": 2.52
+ },
+ {
+  "src": "d165297e45764d70a984a3cd544cf1b1.mp3",
+  "out": "d165297e45764d70a984a3cd544cf1b1.wav",
+  "sec_before": 5.4,
+  "sec_after": 3.24,
+  "segments": 2,
+  "voiced_sec": 2.72,
+  "cut_sec": 2.16
+ },
+ {
+  "src": "d1f5755ea4e444c5ae957f7382212f59.mp3",
+  "out": "d1f5755ea4e444c5ae957f7382212f59.wav",
+  "sec_before": 3.02,
+  "sec_after": 1.38,
+  "segments": 1,
+  "voiced_sec": 1.12,
+  "cut_sec": 1.64
+ },
+ {
+  "src": "e94518dd166043fcba46b963d277271d.mp3",
+  "out": "e94518dd166043fcba46b963d277271d.wav",
+  "sec_before": 2.74,
+  "sec_after": 1.19,
+  "segments": 1,
+  "voiced_sec": 0.93,
+  "cut_sec": 1.55
+ },
+ {
+  "src": "ecc7c8c453d44410a583ba73417e2447.mp3",
+  "out": "ecc7c8c453d44410a583ba73417e2447.wav",
+  "sec_before": 2.95,
+  "sec_after": 2.21,
+  "segments": 2,
+  "voiced_sec": 1.73,
+  "cut_sec": 0.74
+ },
+ {
+  "src": "ed174465e6484de68a272c97ee0583e3.mp3",
+  "out": "ed174465e6484de68a272c97ee0583e3.wav",
+  "sec_before": 1.62,
+  "sec_after": 0.8,
+  "segments": 1,
+  "voiced_sec": 0.54,
+  "cut_sec": 0.82
+ },
+ {
+  "src": "f26882db5724430b84185d69dd619b65.mp3",
+  "out": "f26882db5724430b84185d69dd619b65.wav",
+  "sec_before": 5.33,
+  "sec_after": 3.62,
+  "segments": 2,
+  "voiced_sec": 3.2,
+  "cut_sec": 1.71
+ }
+]

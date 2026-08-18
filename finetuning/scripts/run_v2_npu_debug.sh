@@ -63,6 +63,11 @@ SAVE_EVERY=${SAVE_EVERY:-500}
 SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-0}
 # 序列长度分桶：昇腾按形状编译算子，分桶让编译结果跨 step 复用（NPU 实测省 ~13%）
 LENGTH_BUCKET=${LENGTH_BUCKET:-64}
+# sub-talker 的帧数分桶。它走布尔掩码索引，形状=这批音频实际总帧数，
+# 与 LENGTH_BUCKET 无关、完全动态（batch=8 约 524 种，超过
+# ACLNN_CACHE_LIMIT=300）——NPU「~7MB/步显存泄漏」的头号嫌疑。
+# 设 64 降到 12 种；对 loss 零影响（padding label 填 -100，已实测逐位相同）。
+SUB_TALKER_FRAME_BUCKET=${SUB_TALKER_FRAME_BUCKET:-64}
 # speaker 向量。SPK_MODEL_PATH 必须指向 **Base** 权重 —— speaker_encoder
 # 只在 tts_model_type=base 里有，VoiceDesign/CustomVoice 都是 0 张量。
 # 默认开：spk 文件放 qwen3_spk_emb/（1.78GB，行序与 train_codes.jsonl 对齐）。
@@ -134,6 +139,7 @@ echo ">>> 训练"
     --save-every "$SAVE_EVERY" \
     --save-total-limit "$SAVE_TOTAL_LIMIT" \
     --length-bucket "$LENGTH_BUCKET" \
+    --sub-talker-frame-bucket "$SUB_TALKER_FRAME_BUCKET" \
     --max_steps "$MAX_STEPS" \
     ${SPK_FILE:+--spk-file "$SPK_FILE" --spk-drop-prob "$SPK_DROP_PROB"} \
     --log_every 1 2>&1 | tee -a "$LOG"

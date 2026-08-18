@@ -2002,3 +2002,81 @@ NPU 侧不受影响：启动脚本里 `pip install --user -e "$REPO_ROOT"` 装�
    `qwen_tts/core/models/modeling_qwen3_tts.py` 的 `forward_sub_talker_finetune`
    （1634 行起）与 sft 脚本 `_sub_talker_loss`——注意开发机 CUDA 上复现不了，
    需在 NPU 上做二分实验
+
+## 21. NPU 显存泄漏：sub-talker 的形状没分桶（开发机侧定位，2026-08-18）
+
+针对十四轮记的「~7MB/步 逐步泄漏、与 sdpa/eager 无关、CUDA 复现不了」，
+开发机侧查了嫌疑代码，**给出一个可证伪的头号嫌疑，并已实现修复**。
+
+### 21.1 根因假说
+
+`finetuning/sft_12hz_voicedesign.py` 的 `_sub_talker_loss`：
+
+```python
+target = codec_mask[:, 1:]
+hs = hidden_states[:, :-1][target]     # ← 布尔掩码索引
+```
+
+产出 `[N_frames, hidden]`，而 **N_frames = 这一批音频的实际总帧数**。
+主路径被 `--length-bucket 64` 分了桶，**这条路完全没有** —— 它跟序列 padding
+无关，只跟真实音频长度有关。
+
+按真实时长分布估算（VAD 后 p50≈2s、p99 10.5s、max 24s，12Hz，batch=8）：
+
+| | 不同形状数 |
+|---|---|
+| 不分桶 | **约 524 种**（范围 88-839） |
+| 分桶到 64 | **12 种** |
+
+昇腾按形状编译算子，每种形状要单独编内核并占一份 workspace。
+而 **524 > 默认 `ACLNN_CACHE_LIMIT=300`** —— 这正好解释了十四轮记的
+「`ACLNN_CACHE_LIMIT=300` 没拦住」：缓存在颠簸，调大才可能有效，
+但调大只是让它占更多显存。
+
+**与全部已观察现象吻合**：
+- CUDA 复现不了 ✓（动态形状原生支持，不编译）
+- 与 sdpa/eager 无关 ✓（在 sub-talker 路径，不在注意力）
+- 每块新进程仍从 ~51GB 爬到 59.9GB ✓（进程内形状仍在不断出新）
+
+### 21.2 已实现的修复：`--sub-talker-frame-bucket`（默认 64）
+
+把 N_frames 向上取整到该倍数（0 = 关闭，保持原行为）。
+
+**对 loss 零影响**（已实测逐位相同）：`codec_ids` 那份补 **0**
+（embedding 查表要合法下标，不能填 -100），`labels` 那份补 **-100**，
+而 `_compute_token_ce_loss` 用 `ignore_index=-100` + `reduction='mean'`，
+被忽略项分子分母都不计入。为此给
+`forward_sub_talker_finetune` 加了可选的 `labels` 参数（不传时行为不变）。
+
+开发机实测：
+
+```
+真实帧数 N_frames = 112
+  bucket=  64 补  16 行 -> 6.033465 vs 原 6.033465  ✅ 一致
+  bucket= 128 补  16 行 -> 6.033465 vs 原 6.033465  ✅ 一致
+  bucket= 256 补 144 行 -> 6.033465 vs 原 6.033465  ✅ 一致
+
+500 步模拟：不分桶 230 种形状 → bucket=64 只剩 8 种（3%）
+```
+
+两个启动脚本已透传 `SUB_TALKER_FRAME_BUCKET`（默认 64）。
+
+### 21.3 建议怎么验（比十四轮的方案 B 更省一轮）
+
+十四轮的方案 B 是「`sub_talker_loss` 关掉跑 1000 步」——那只能**定位**，
+不能修（关掉就没有 1-15 号码本的监督了）。本节的修复做**同一个预测**，
+且验证成功即修好：
+
+```bash
+# 直接带上默认的 SUB_TALKER_FRAME_BUCKET=64 跑一块，盯显存水位
+SUB_TALKER_FRAME_BUCKET=64 SKIP_PREPARE=1 ... bash run_v2_npu_debug.sh
+```
+
+- **水位不再爬** → 假说成立且已修，恢复 5000 步块（约 17h）
+- **仍然爬** → 假说被否，再按十四轮方案 B 二分
+  （`forward_sub_talker_finetune` 的中间张量 / RMSNorm 反传 /
+  code_predictor 的 16 通道循环）
+
+> 顺带：`--length-bucket` 只管主序列长度，**不管这条路** —— 这是两个独立的桶。
+> 如果泄漏确实在这里，那么当初「分桶只省了 13%」的结论也有了解释：
+> 主路径分了桶，sub-talker 还在每步编译新形状。

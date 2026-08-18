@@ -1631,7 +1631,13 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
     def get_decoder(self):
         return self.model
     
-    def forward_sub_talker_finetune(self, codec_ids, talker_hidden_states):
+    def forward_sub_talker_finetune(self, codec_ids, talker_hidden_states, labels=None):
+        """labels 默认为 codec_ids[:, 1:]（原行为）。
+
+        单独给 labels 是为了让调用方能把 padding 行标成 -100 —— codec_ids 同时
+        当 embedding 输入用，不能直接填 -100（查表会越界）。见 sft 脚本里
+        `_sub_talker_loss` 的帧数分桶。
+        """
         assert len(codec_ids.shape) == 2
         assert len(talker_hidden_states.shape) == 2
         assert codec_ids.shape[0] == talker_hidden_states.shape[0]
@@ -1647,8 +1653,9 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 sub_talker_inputs_embeds.append(self.code_predictor.get_input_embeddings()[i-1](codec_ids[:, i:i+1]))
         sub_talker_inputs_embeds = torch.cat(sub_talker_inputs_embeds, dim=1)
         
-        sub_talker_outputs = self.code_predictor.forward_finetune(inputs_embeds=sub_talker_inputs_embeds,
-                                                                 labels=codec_ids[:, 1:])
+        sub_talker_outputs = self.code_predictor.forward_finetune(
+            inputs_embeds=sub_talker_inputs_embeds,
+            labels=codec_ids[:, 1:] if labels is None else labels)
         
         sub_talker_logits = sub_talker_outputs.logits
         sub_talker_loss = sub_talker_outputs.loss
