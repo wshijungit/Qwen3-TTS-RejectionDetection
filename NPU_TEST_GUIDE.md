@@ -2093,3 +2093,41 @@ SUB_TALKER_FRAME_BUCKET=64 SKIP_PREPARE=1 ... bash run_v2_npu_debug.sh
 > 顺带：`--length-bucket` 只管主序列长度，**不管这条路** —— 这是两个独立的桶。
 > 如果泄漏确实在这里，那么当初「分桶只省了 13%」的结论也有了解释：
 > 主路径分了桶，sub-talker 还在每步编译新形状。
+
+### 21.4 NPU 侧要做的只有一个实验（不用跑冒烟，也没有要回答的问题）
+
+代码已改完并在 CUDA 上验过（loss 逐位不变、形状降 93%）。**唯一还需要 NPU 的，
+是判断"形状数是不是泄漏的原因"** —— 这个 CUDA 复现不了。
+
+训练脚本现在每次打日志都会附上显存水位与斜率，直接读日志即可，不用自己插桩：
+
+```
+Epoch 0 | Step 120 | Loss: 3.2415 | mem 51.30GB (+6.83MB/步)
+```
+
+（前 20 步只报水位不报斜率 —— 加载与首次编译的一次性开销会把斜率算歪。）
+
+**实验**：拿现有 ckpt 热启，跑 1000-2000 步，只看斜率。
+
+```bash
+cd scripts
+MODEL_PATH=$E/runs/v2_full/checkpoint-step5000 \
+OUTPUT_DIR=$E/runs/leak_probe \
+SUB_TALKER_FRAME_BUCKET=64 \
+SKIP_PREPARE=1 BATCH_SIZE=8 MAX_STEPS=2000 LOG_EVERY=50 \
+bash run_v2_npu_debug.sh
+```
+
+| 斜率 | 结论 | 下一步 |
+|---|---|---|
+| **≈ 0**（对照：CUDA 上实测 `+0.00MB/步`） | 假说成立，已修 | 回 5000 步块跑完剩下的（约 17h） |
+| **仍 ≈ +7MB/步** | 假说被否 | 按十四轮方案 B 二分：先 `--sub_talker_loss_weight 0` 跑 1000 步；仍爬则查 RMSNorm 反传 / code_predictor 16 通道循环 |
+| 介于两者之间 | 部分成立 | 说明还有第二个源，同样按 B 二分 |
+
+**为什么不用先跑冒烟**：这次改动只碰两处（`_sub_talker_loss` 的 padding、
+`forward_sub_talker_finetune` 多一个可选 `labels` 参数），都在 CUDA 上跑通了
+训练与保存；而这个实验本身就是一次真实训练，它要是崩了会立刻看到。
+冒烟只有 6 步，反而看不出斜率 —— 直接跑这个更省一轮。
+
+**顺带**：`SUB_TALKER_FRAME_BUCKET` 默认已是 64，上面显式写出来只是为了让
+对照实验（设 0）好写。若要测不分桶的基准：`SUB_TALKER_FRAME_BUCKET=0`。

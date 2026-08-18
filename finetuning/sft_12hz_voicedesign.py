@@ -160,6 +160,37 @@ class V2TrainStep(torch.nn.Module):
         )
 
 
+# 显存水位记录：NPU 侧观察到 ~7MB/步 的逐步爬升（§21），要判断某个改动有没有
+# 止住它，必须能看到**斜率**而不只是峰值。这里每次打日志时附一行水位，
+# 并给出自开始记录以来的 MB/步 —— 直接读日志就能对比，不用另外插桩。
+_MEM0 = {}
+
+
+def _mem_note(gstep):
+    """返回 ' | mem 51.2GB (+6.8MB/步)'；设备不支持则返回空串。"""
+    try:
+        import torch as _t
+
+        if hasattr(_t, "npu") and _t.npu.is_available():
+            free, total = _t.npu.mem_get_info(0)
+        elif _t.cuda.is_available():
+            free, total = _t.cuda.mem_get_info(0)
+        else:
+            return ""
+        used = (total - free) / 2 ** 20        # MiB
+    except Exception:
+        return ""
+    if "s0" not in _MEM0:
+        # 跳过前若干步：加载/首次编译的一次性开销会把斜率算歪
+        if gstep < 20:
+            return f" | mem {used / 1024:.2f}GB"
+        _MEM0["s0"], _MEM0["m0"] = gstep, used
+        return f" | mem {used / 1024:.2f}GB (基准)"
+    d = gstep - _MEM0["s0"]
+    slope = (used - _MEM0["m0"]) / d if d > 0 else 0.0
+    return f" | mem {used / 1024:.2f}GB ({slope:+.2f}MB/步)"
+
+
 def _sub_talker_loss(talker, codec_ids, codec_mask, hidden_states, frame_bucket=0):
     """sub-talker（1..15 号码本）的 loss。
 
@@ -324,7 +355,8 @@ def train():
                 optimizer.zero_grad()
 
             if step % args.log_every == 0:
-                accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
+                accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}"
+                                  + _mem_note(gstep))
             gstep += 1
             if args.save_every > 0 and gstep % args.save_every == 0:
                 _save(accelerator, model, args, MODEL_PATH, f"step{gstep}")
