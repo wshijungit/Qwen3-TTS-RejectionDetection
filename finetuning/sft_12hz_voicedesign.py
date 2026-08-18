@@ -161,13 +161,18 @@ class V2TrainStep(torch.nn.Module):
 
 
 # 显存水位记录：NPU 侧观察到 ~7MB/步 的逐步爬升（§21），要判断某个改动有没有
-# 止住它，必须能看到**斜率**而不只是峰值。这里每次打日志时附一行水位，
-# 并给出自开始记录以来的 MB/步 —— 直接读日志就能对比，不用另外插桩。
-_MEM0 = {}
+# 止住它，必须能看到**斜率**而不只是峰值。
+#
+# 用**滑动窗口**斜率，不是"自基准点的累计平均"：首版用了累计平均，结果早期
+# 一次性的编译开销把均值长期拖高——NPU 侧实测水位数百步纹丝不动（54.24→54.25GB），
+# 累计斜率却还显示 +7.8MB/步，害人以为仍在漏。窗口斜率只看最近这一段，
+# 早期尖峰滚出窗口就不再影响判断。
+_MEM_HIST = []
+_MEM_WIN = 20          # 参与拟合的最近日志点数
 
 
 def _mem_note(gstep):
-    """返回 ' | mem 51.2GB (+6.8MB/步)'；设备不支持则返回空串。"""
+    """返回 ' | mem 54.25GB (近 20 点 +0.01MB/步)'；设备不支持则返回空串。"""
     try:
         import torch as _t
 
@@ -180,15 +185,18 @@ def _mem_note(gstep):
         used = (total - free) / 2 ** 20        # MiB
     except Exception:
         return ""
-    if "s0" not in _MEM0:
-        # 跳过前若干步：加载/首次编译的一次性开销会把斜率算歪
-        if gstep < 20:
-            return f" | mem {used / 1024:.2f}GB"
-        _MEM0["s0"], _MEM0["m0"] = gstep, used
-        return f" | mem {used / 1024:.2f}GB (基准)"
-    d = gstep - _MEM0["s0"]
-    slope = (used - _MEM0["m0"]) / d if d > 0 else 0.0
-    return f" | mem {used / 1024:.2f}GB ({slope:+.2f}MB/步)"
+    _MEM_HIST.append((gstep, used))
+    if len(_MEM_HIST) > _MEM_WIN:
+        _MEM_HIST.pop(0)
+    if len(_MEM_HIST) < 3:
+        return f" | mem {used / 1024:.2f}GB"
+    # 最小二乘拟合窗口内的 (step, MiB)，比首末两点差稳得多
+    n = len(_MEM_HIST)
+    sx = sum(p[0] for p in _MEM_HIST); sy = sum(p[1] for p in _MEM_HIST)
+    sxx = sum(p[0] * p[0] for p in _MEM_HIST); sxy = sum(p[0] * p[1] for p in _MEM_HIST)
+    den = n * sxx - sx * sx
+    slope = (n * sxy - sx * sy) / den if den else 0.0
+    return f" | mem {used / 1024:.2f}GB (近 {n} 点 {slope:+.2f}MB/步)"
 
 
 def _sub_talker_loss(talker, codec_ids, codec_mask, hidden_states, frame_bucket=0):
