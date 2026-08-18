@@ -161,13 +161,18 @@ class V2TrainStep(torch.nn.Module):
 
 
 # 显存水位记录：NPU 侧观察到 ~7MB/步 的逐步爬升（§21），要判断某个改动有没有
-# 止住它，必须能看到**斜率**而不只是峰值。这里每次打日志时附一行水位，
-# 并给出自开始记录以来的 MB/步 —— 直接读日志就能对比，不用另外插桩。
-_MEM0 = {}
+# 止住它，必须能看到**斜率**而不只是峰值。
+#
+# 用**滑动窗口**斜率，不是"自基准点的累计平均"：首版用了累计平均，结果早期
+# 一次性的编译开销把均值长期拖高——NPU 侧实测水位数百步纹丝不动（54.24→54.25GB），
+# 累计斜率却还显示 +7.8MB/步，害人以为仍在漏。窗口斜率只看最近这一段，
+# 早期尖峰滚出窗口就不再影响判断。
+_MEM_HIST = []
+_MEM_WIN = 20          # 参与拟合的最近日志点数
 
 
 def _mem_note(gstep):
-    """返回 ' | mem 51.2GB (+6.8MB/步)'；设备不支持则返回空串。"""
+    """返回 ' | mem 54.25GB (近 20 点 +0.01MB/步)'；设备不支持则返回空串。"""
     try:
         import torch as _t
 
@@ -180,15 +185,18 @@ def _mem_note(gstep):
         used = (total - free) / 2 ** 20        # MiB
     except Exception:
         return ""
-    if "s0" not in _MEM0:
-        # 跳过前若干步：加载/首次编译的一次性开销会把斜率算歪
-        if gstep < 20:
-            return f" | mem {used / 1024:.2f}GB"
-        _MEM0["s0"], _MEM0["m0"] = gstep, used
-        return f" | mem {used / 1024:.2f}GB (基准)"
-    d = gstep - _MEM0["s0"]
-    slope = (used - _MEM0["m0"]) / d if d > 0 else 0.0
-    return f" | mem {used / 1024:.2f}GB ({slope:+.2f}MB/步)"
+    _MEM_HIST.append((gstep, used))
+    if len(_MEM_HIST) > _MEM_WIN:
+        _MEM_HIST.pop(0)
+    if len(_MEM_HIST) < 3:
+        return f" | mem {used / 1024:.2f}GB"
+    # 最小二乘拟合窗口内的 (step, MiB)，比首末两点差稳得多
+    n = len(_MEM_HIST)
+    sx = sum(p[0] for p in _MEM_HIST); sy = sum(p[1] for p in _MEM_HIST)
+    sxx = sum(p[0] * p[0] for p in _MEM_HIST); sxy = sum(p[0] * p[1] for p in _MEM_HIST)
+    den = n * sxx - sx * sx
+    slope = (n * sxy - sx * sy) / den if den else 0.0
+    return f" | mem {used / 1024:.2f}GB (近 {n} 点 {slope:+.2f}MB/步)"
 
 
 def _sub_talker_loss(talker, codec_ids, codec_mask, hidden_states, frame_bucket=0):
@@ -273,6 +281,14 @@ def train():
              "fp32 = fp32 权重 + autocast bf16 计算（标准混合精度），静态约 25GiB，"
              "910B2 的 64GB 吃得下，收敛更稳。显存不紧就用 fp32")
     parser.add_argument(
+        "--optim-state", type=str, default=None,
+        help="optimizer 状态文件路径。**分块训练必须给** —— 本脚本的热启是权重级的，"
+             "不给这个参数，每块开头都是全新的 AdamW（m=0, v=0）：此时二阶矩估计还没"
+             "建立，前若干步的更新量接近 lr·sign(g)，远大于稳态，等于每块挨一次冲击。"
+             "5000 步一块、10 万步总量就是 20 多次。给了则块末写、块初读，"
+             "使分块训练等价于连续训练。fp32 下约 13.6GB（1.7B × 2 个动量），"
+             "每次覆盖写，只占一份")
+    parser.add_argument(
         "--sub-talker-frame-bucket", type=int, default=0,
         help="把 sub-talker 的帧数向上取整到该倍数（0=关闭）。"
              "sub-talker 走布尔掩码索引，形状 = 这批音频的实际总帧数，"
@@ -340,6 +356,17 @@ def train():
     )
     model.train()
 
+    # 恢复 optimizer 状态（分块训练用）。放在 prepare 之后 —— 此时 optimizer
+    # 里的 param 引用已经是 prepare 后的那些，state_dict 的 key 才对得上。
+    if args.optim_state and os.path.exists(args.optim_state):
+        sd = torch.load(args.optim_state, map_location="cpu")
+        optimizer.load_state_dict(sd)
+        n = sum(1 for v in optimizer.state.values() if v)
+        accelerator.print(f"已恢复 optimizer 状态 ← {args.optim_state}"
+                          f"（{n} 个参数带动量）")
+    elif args.optim_state:
+        accelerator.print(f"optimizer 状态文件不存在，本块从零开始: {args.optim_state}")
+
     gstep = 0
     stop = False
     for epoch in range(args.num_epochs):
@@ -368,6 +395,13 @@ def train():
         # 无论是正常跑完一个 epoch 还是被 --max_steps 截断，都要落盘，
         # 否则调试跑（--max_steps 50）训完磁盘上什么都没有
         _save(accelerator, model, args, MODEL_PATH, epoch)
+        # 块末写 optimizer 状态：分块训练靠它把 AdamW 动量接上（见 --optim-state）
+        if args.optim_state and accelerator.is_main_process:
+            os.makedirs(os.path.dirname(os.path.abspath(args.optim_state)) or ".", exist_ok=True)
+            tmp = args.optim_state + ".tmp"
+            torch.save(optimizer.state_dict(), tmp)
+            os.replace(tmp, args.optim_state)   # 原子替换，崩在写一半不会留下坏文件
+            accelerator.print(f"已保存 optimizer 状态 → {args.optim_state}")
         if stop:
             break
 
