@@ -2151,3 +2151,18 @@ bash run_v2_npu_debug.sh
    但 step1178 峰值 OOM → 残余问题是基线 54GB 离 61GB 太近
 3. 对策与现状：batch 8→4 + ACLNN_CACHE_LIMIT 100，从 step35000 续跑
    2-epoch（wrapper 支持 START/BS/CACHE 参数），预计 10-12h 完成
+
+### 十六轮（NPU 侧）：2-epoch 全量训练完成 + 末段保存崩溃（2026-08-19）
+
+1. **训练完成**：108,054/108,054 步（2 epoch）全部跑完，batch=4 + cache=100
+   下水位稳定 ~41-47GB，无 OOM；loss 100 步均值收敛至 ~2.1；probes 到 step105000
+   （每 5k 一对，共 43 个 wav 可听全程）
+2. **末段保存崩溃（新 bug，权重无损）**：最后一块（105000+3054）训完所有步后，
+   epoch 末保存 `_save(..., epoch)` 以启动时的 `MODEL_PATH`（上块 ckpt
+   checkpoint-step5000）为 copytree 源，但 `SAVE_TOTAL_LIMIT=1` 的清理已先把它
+   删掉（SFS 上 rmtree 还留下 speech_tokenizer 残壳）→ FileNotFoundError。
+   **最终权重完好**：checkpoint-step3054（= 108,054 步）已人工复制为
+   checkpoint-epoch-0（md5 一致），`runs/v2_full/checkpoint-epoch-0` 即最终模型
+3. **修复建议（远端 agent 接手）**：epoch 保存的 copytree 源不应是启动时
+   MODEL_PATH，应跟踪「最近一次成功保存的 step 目录」；或清理逻辑跳过当前
+   MODEL_PATH
