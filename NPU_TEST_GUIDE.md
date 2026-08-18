@@ -1974,3 +1974,31 @@ NPU 侧不受影响：启动脚本里 `pip install --user -e "$REPO_ROOT"` 装�
 **教训**：这次和上次是同一个错误的两种形态 —— **验证复刻了代码，而不是复现了场景**。
 `sys.path` 守卫要验的是"真实 import 顺序下加载到谁"，不是"这几行能不能跑"。
 凡是防御性代码，验证必须构造出它本该拦住的那个失败。
+
+### 十四轮（NPU 侧）：2-epoch 分块训练 + 逐步显存泄漏定位中（2026-08-18）
+
+1. **首轮 OOM 复盘**：fp32 全量（54k 步单进程）在 step ~37k 时 sub-talker 路径
+   OOM（59.70/60.96GB，一个 114MB 请求压垮）——当时判断是 aclnn 编译缓存累积
+2. **改为 2-epoch 分块训练**（用户要求：从头重训、lr 余弦 2e-5→2e-6、
+   每 5000 步覆盖式 ckpt、每块后随机 spk 探测推理）：wrapper
+   `qwen_tts_exp/logs/run_v2_2epoch.sh`（BLOCK/TOTAL/OUT_DIR/LOG_FILE 可参数化），
+   冒烟（2×50 步）验证机制全通：训块→探测（对机/人对各一条 wav）→热启下一块
+3. **块 8 又 OOM（累计 35k）**：`ACLNN_CACHE_LIMIT=300` 没拦住——每块是**新进程**
+   （缓存每块重置），但 5000 步内水位仍从 ~51GB 爬到 59.9GB → **缓存假说排除**，
+   是 **~7MB/步 的逐步泄漏**
+4. **eager 对照实验**：2000 步同样爬升（1199 步时 60.3GB，2000 步勉强跑完）
+   → **泄漏与 sdpa/eager 无关**，在 torch_npu 2.1 的通用路径（CUDA/H200 上
+   未见过此现象，属 NPU 侧特有）
+5. **现状**：训练停止在累计 step 35,000；最新 ckpt `runs/v2_full/checkpoint-step5000`
+   （覆盖式命名）；probes 14 个（step5000~35000 每 5k 一对对机/对人 wav 可听）；
+   每块 lr 按余弦 1.52e-05（35k 处）正常衰减
+6. **待决两个方案**：
+   - A 保训练：块 5000→**1000 步**（峰值 ~59GB 不触顶），总时长约 26h
+   - B 先定位：sub_talker_loss 关闭（weight=0）跑 1000 步对照——水位不爬则泄漏
+     在 `forward_sub_talker_finetune`（每步构造 sub_talker_inputs_embeds/logits 的
+     中间张量），修掉后恢复 5000 步块（~17h）。若仍爬，继续二分
+     （RMSNorm 反传 / code_predictor 16 通道循环）
+   **远端 agent 可直接接手查泄漏**：嫌疑代码
+   `qwen_tts/core/models/modeling_qwen3_tts.py` 的 `forward_sub_talker_finetune`
+   （1634 行起）与 sft 脚本 `_sub_talker_loss`——注意开发机 CUDA 上复现不了，
+   需在 NPU 上做二分实验
