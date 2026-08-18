@@ -74,6 +74,11 @@ LENGTH_BUCKET=${LENGTH_BUCKET:-64}
 # ACLNN_CACHE_LIMIT=300）——NPU「~7MB/步显存泄漏」的头号嫌疑。
 # 设 64 降到 12 种；对 loss 零影响（padding label 填 -100，已实测逐位相同）。
 SUB_TALKER_FRAME_BUCKET=${SUB_TALKER_FRAME_BUCKET:-64}
+# optimizer 状态文件（约 14GB，覆盖写）。**分块训练必须给** —— 本脚本的热启
+# 是权重级的，不给这个每块开头都是全新 AdamW（m=0,v=0），二阶矩没建立时
+# 更新量接近 lr·sign(g)，等于每块挨一次冲击。开发机实测：块2 首步 loss
+# 不接状态 4.26 / 接上 2.10。留空则不存不读（行为同以前）。
+OPTIM_STATE=${OPTIM_STATE:-}
 # speaker 向量。SPK_MODEL_PATH 必须指向 **Base** 权重 —— speaker_encoder
 # 只在 tts_model_type=base 里有，VoiceDesign/CustomVoice 都是 0 张量。
 # 默认开：spk 文件放 qwen3_spk_emb/（1.78GB，行序与 train_codes.jsonl 对齐）。
@@ -132,6 +137,7 @@ cd "$FT_DIR"
     --save-every "$SAVE_EVERY" \
     --length-bucket "$LENGTH_BUCKET" \
     --sub-talker-frame-bucket "$SUB_TALKER_FRAME_BUCKET" \
+    ${OPTIM_STATE:+--optim-state "$OPTIM_STATE"} \
     ${SPK_FILE:+--spk-file "$SPK_FILE" --spk-drop-prob "$SPK_DROP_PROB"} \
     --log_every 10 2>&1 | tee "$LOG"
 

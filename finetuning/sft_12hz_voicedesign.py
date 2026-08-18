@@ -281,6 +281,14 @@ def train():
              "fp32 = fp32 权重 + autocast bf16 计算（标准混合精度），静态约 25GiB，"
              "910B2 的 64GB 吃得下，收敛更稳。显存不紧就用 fp32")
     parser.add_argument(
+        "--optim-state", type=str, default=None,
+        help="optimizer 状态文件路径。**分块训练必须给** —— 本脚本的热启是权重级的，"
+             "不给这个参数，每块开头都是全新的 AdamW（m=0, v=0）：此时二阶矩估计还没"
+             "建立，前若干步的更新量接近 lr·sign(g)，远大于稳态，等于每块挨一次冲击。"
+             "5000 步一块、10 万步总量就是 20 多次。给了则块末写、块初读，"
+             "使分块训练等价于连续训练。fp32 下约 13.6GB（1.7B × 2 个动量），"
+             "每次覆盖写，只占一份")
+    parser.add_argument(
         "--sub-talker-frame-bucket", type=int, default=0,
         help="把 sub-talker 的帧数向上取整到该倍数（0=关闭）。"
              "sub-talker 走布尔掩码索引，形状 = 这批音频的实际总帧数，"
@@ -348,6 +356,17 @@ def train():
     )
     model.train()
 
+    # 恢复 optimizer 状态（分块训练用）。放在 prepare 之后 —— 此时 optimizer
+    # 里的 param 引用已经是 prepare 后的那些，state_dict 的 key 才对得上。
+    if args.optim_state and os.path.exists(args.optim_state):
+        sd = torch.load(args.optim_state, map_location="cpu")
+        optimizer.load_state_dict(sd)
+        n = sum(1 for v in optimizer.state.values() if v)
+        accelerator.print(f"已恢复 optimizer 状态 ← {args.optim_state}"
+                          f"（{n} 个参数带动量）")
+    elif args.optim_state:
+        accelerator.print(f"optimizer 状态文件不存在，本块从零开始: {args.optim_state}")
+
     gstep = 0
     stop = False
     for epoch in range(args.num_epochs):
@@ -376,6 +395,13 @@ def train():
         # 无论是正常跑完一个 epoch 还是被 --max_steps 截断，都要落盘，
         # 否则调试跑（--max_steps 50）训完磁盘上什么都没有
         _save(accelerator, model, args, MODEL_PATH, epoch)
+        # 块末写 optimizer 状态：分块训练靠它把 AdamW 动量接上（见 --optim-state）
+        if args.optim_state and accelerator.is_main_process:
+            os.makedirs(os.path.dirname(os.path.abspath(args.optim_state)) or ".", exist_ok=True)
+            tmp = args.optim_state + ".tmp"
+            torch.save(optimizer.state_dict(), tmp)
+            os.replace(tmp, args.optim_state)   # 原子替换，崩在写一半不会留下坏文件
+            accelerator.print(f"已保存 optimizer 状态 → {args.optim_state}")
         if stop:
             break
 
